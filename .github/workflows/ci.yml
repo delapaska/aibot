@@ -46,6 +46,7 @@ jobs:
         run: go test ./... -race -covermode=atomic -coverprofile=coverage.out
 
       - name: Coverage report and gate
+        id: coverage
         run: |
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
           echo "### Test coverage: ${total}%" >> "$GITHUB_STEP_SUMMARY"
@@ -74,6 +75,10 @@ jobs:
           TOTAL: ${{ steps.coverage.outputs.coverage }}
         run: |
           set -euo pipefail
+          if [ -z "$TOTAL" ]; then
+            echo "::error::TOTAL is empty — coverage step output was not passed"
+            exit 1
+          fi
           out="$GITHUB_WORKSPACE/badge"
           mkdir -p "$out"
 
