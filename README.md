@@ -1,5 +1,8 @@
 # Тестовое задание: ИИ-бот учёта расходов
 
+[![CI](https://github.com/delapaska/aibot/actions/workflows/ci.yml/badge.svg)](https://github.com/delapaska/aibot/actions/workflows/ci.yml)
+[![coverage](https://delapaska.github.io/aibot/coverage.svg)](https://github.com/delapaska/aibot/actions/workflows/ci.yml)
+
 Нужно сделать сервис учёта семейных расходов. Член семьи пишет боту в Telegram «кофе 350», и трата сохраняется: бот сам определяет сумму, категорию и дату.
 
 Сервис состоит из двух частей:

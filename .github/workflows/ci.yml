@@ -8,6 +8,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # the badge publish step pushes to the gh-pages branch
     defaults:
       run:
         working-directory: backend
@@ -62,3 +64,69 @@ jobs:
           name: coverage-profile
           path: backend/coverage.out
           if-no-files-found: ignore
+
+      # The coverage badge is a self-generated SVG hosted on GitHub Pages
+      # (gh-pages branch): no third-party coverage service is involved, so
+      # the badge is reachable from any network, Russia included.
+      - name: Build coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          TOTAL: ${{ steps.coverage.outputs.coverage }}
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/badge"
+          mkdir -p "$out"
+
+          color=$(awk -v t="$TOTAL" 'BEGIN {
+            if (t >= 90) print "#4c1"
+            else if (t >= 80) print "#97ca00"
+            else if (t >= 70) print "#dfb317"
+            else print "#e05d44" }')
+          word=$(awk -v t="$TOTAL" 'BEGIN {
+            if (t >= 90) print "brightgreen"
+            else if (t >= 80) print "green"
+            else if (t >= 70) print "yellow"
+            else print "red" }')
+
+          msg="coverage: ${TOTAL}%"
+          label="coverage"
+          value="${TOTAL}%"
+          lw=$(( ${#label} * 7 + 14 ))
+          rw=$(( ${#value} * 7 + 14 ))
+          w=$(( lw + rw ))
+
+          cat > "$out/coverage.svg" <<EOF
+          <svg xmlns="http://www.w3.org/2000/svg" width="$w" height="20" role="img" aria-label="$msg">
+            <title>$msg</title>
+            <linearGradient id="s" x2="0" y2="100%">
+              <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+              <stop offset="1" stop-opacity=".1"/>
+            </linearGradient>
+            <clipPath id="r"><rect width="$w" height="20" rx="3" fill="#fff"/></clipPath>
+            <g clip-path="url(#r)">
+              <rect width="$lw" height="20" fill="#555"/>
+              <rect x="$lw" width="$rw" height="20" fill="$color"/>
+              <rect width="$w" height="20" fill="url(#s)"/>
+            </g>
+            <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">
+              <text x="$(( lw / 2 ))" y="14" fill="#010101" fill-opacity=".3">$label</text>
+              <text x="$(( lw / 2 ))" y="13.5">$label</text>
+              <text x="$(( lw + rw / 2 ))" y="14" fill="#010101" fill-opacity=".3">$value</text>
+              <text x="$(( lw + rw / 2 ))" y="13.5">$value</text>
+            </g>
+          </svg>
+          EOF
+
+          # Shields.io endpoint format, in case the badge is ever served
+          # through img.shields.io/endpoint instead of the SVG.
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s","color":"%s"}\n' "$value" "$word" > "$out/coverage.json"
+          echo "badge: ${value} (${word})"
+
+      - name: Publish badge to GitHub Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: badge
+          force_orphan: true # keep the branch a single commit, no history bloat

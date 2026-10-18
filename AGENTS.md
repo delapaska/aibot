@@ -18,8 +18,7 @@
   - `internal/domain/` — сущности и бизнес-правила; **не импортирует** ничего из app/adapter/infra
   - `internal/app/port/` — интерфейсы (порты): репозитории, LLM-клиент, часы
   - `internal/app/usecase/` — сценарии приложения; зависят только от портов и домена
-  - `internal/adapter/` — реализации портов: `httpapi/`, `telegram/`, `llm/`
-  - `internal/infra/` — `postgres/` (pgx, миграции), `config/` (env-конфиг)
+  - `internal/infra/` — реализации портов и инфраструктура: `httpapi/`, `telegram/` (long polling), `llm/` (OpenAI-совместимый), `postgres/` (pgx, миграции), `clocksys/`, `config/` (env-конфиг)
 - `frontend/` — React + Vite + TypeScript, статика встраивается в Go-бинарь
 - `docs/` — `architecture.md`, `security.md`
 - `docker-compose.yml`, `Dockerfile`, `Makefile`, `.env.example`
@@ -62,4 +61,4 @@
 - Интеграционные тесты репозиториев требуют Postgres (`docker compose up -d db`) и пропускаются, если БД недоступна.
 - Новая логика — с тестами; багфикс — с тестом, воспроизводящим баг.
 - Тестовые дубли — ручные фейки в `internal/app/port/fakes`, а не кодогенерация (Mockery/gomock): фейки — это in-memory реализации контракта (скоупинг, ErrNotFound, сортировка), а не моки с ожиданиями вызовов; портов мало, а зависимости проекта держим минимальными.
-- CI (GitHub Actions, `.github/workflows/ci.yml`): vet + gofmt + тесты с `-race` на Postgres из service-контейнера; покрытие публикуется в Step Summary, порог — 70% (`make cover` локально).
+- CI (GitHub Actions, `.github/workflows/ci.yml`): vet + gofmt + тесты с `-race` на Postgres из service-контейнера; покрытие публикуется в Step Summary, порог — 70% (`make cover` локально); бейдж покрытия — самодельный SVG на GitHub Pages (ветка `gh-pages`), без внешних сервисов вроде Codecov — доступен из РФ.

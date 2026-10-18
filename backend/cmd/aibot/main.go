@@ -20,7 +20,9 @@ import (
 	"github.com/delapaska/aibot/internal/infra/clocksys"
 	"github.com/delapaska/aibot/internal/infra/config"
 	"github.com/delapaska/aibot/internal/infra/httpapi"
+	"github.com/delapaska/aibot/internal/infra/llm"
 	"github.com/delapaska/aibot/internal/infra/postgres"
+	"github.com/delapaska/aibot/internal/infra/telegram"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
@@ -76,6 +78,10 @@ func run() error {
 	expenses := usecase.NewExpenseService(expenseRepo, userRepo, clock)
 	users := usecase.NewUserService(userRepo, clock)
 
+	// LLM agent over the expense service.
+	llmClient := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel, logger)
+	agent := usecase.NewAgent(llmClient, expenses, clock)
+
 	// HTTP API of the panel.
 	api := httpapi.NewServer(expenses, users, logger, cfg.PanelToken)
 	srv := &http.Server{
@@ -93,7 +99,24 @@ func run() error {
 		errCh <- srv.ListenAndServe()
 	}()
 
-	// The Telegram bot is added in a later stage.
+	// Telegram bot: a long-polling loop next to the HTTP server.
+	if cfg.TelegramToken != "" {
+		if len(cfg.AllowedTelegramIDs) == 0 {
+			logger.Warn("ALLOWED_TELEGRAM_IDS is empty: the bot answers to any private chat; set it in production")
+		}
+		botSvc := usecase.NewBotService(users, agent, clock, cfg.AllowedTelegramIDs, logger)
+		poller := telegram.NewPoller(telegram.New(cfg.TelegramToken, logger), botSvc, logger)
+		go func() {
+			if err := poller.Run(ctx); err != nil {
+				errCh <- fmt.Errorf("telegram bot: %w", err)
+			}
+		}()
+		logger.Info("telegram bot started", "allowed_users", len(cfg.AllowedTelegramIDs))
+	} else {
+		logger.Info("telegram bot disabled: TELEGRAM_TOKEN is not set")
+	}
+
+	// The web panel serves the REST API; the bot loop runs above.
 	select {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
