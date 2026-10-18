@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      # The repository integration tests need a real Postgres; they create
+      # their own aibot_test database and clean up after themselves.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: aibot
+          POSTGRES_PASSWORD: aibot
+          POSTGRES_DB: aibot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aibot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Format check
+        run: test -z "$(gofmt -l .)"
+
+      - name: Test with coverage
+        run: go test ./... -race -covermode=atomic -coverprofile=coverage.out
+
+      - name: Coverage report and gate
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
+          echo "### Test coverage: ${total}%" >> "$GITHUB_STEP_SUMMARY"
+          echo "coverage=${total}" >> "$GITHUB_OUTPUT"
+          if awk -v t="$total" 'BEGIN { exit !(t >= 70) }'; then
+            echo "coverage ${total}% >= 70% — OK"
+          else
+            echo "::error::coverage ${total}% is below the 70% gate"
+            exit 1
+          fi
+
+      - name: Upload coverage profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-profile
+          path: backend/coverage.out
+          if-no-files-found: ignore

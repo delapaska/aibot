@@ -8,6 +8,7 @@ package fakes
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -189,3 +190,25 @@ func (f *Users) Get(id int64) (domain.User, bool) {
 type Clock struct{ T time.Time }
 
 func (c Clock) Now() time.Time { return c.T }
+
+// LLM is a scripted port.LLM: it pops queued responses in order and
+// records every request it received, so tests can assert on what the
+// agent sent and script multi-round tool conversations.
+type LLM struct {
+	Queue    []port.ChatResponse // consumed front to back
+	Err      error               // returned on every call when set
+	Requests []port.ChatRequest  // captured requests
+}
+
+func (f *LLM) ChatComplete(_ context.Context, req port.ChatRequest) (port.ChatResponse, error) {
+	f.Requests = append(f.Requests, req)
+	if f.Err != nil {
+		return port.ChatResponse{}, f.Err
+	}
+	if len(f.Queue) == 0 {
+		return port.ChatResponse{}, errors.New("fakes: LLM queue is empty")
+	}
+	resp := f.Queue[0]
+	f.Queue = f.Queue[1:]
+	return resp, nil
+}

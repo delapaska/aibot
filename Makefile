@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build run test vet fmt tidy docker-up docker-down
+.PHONY: build run test cover vet fmt tidy docker-up docker-down
 
 build:
 	cd backend && $(GO) build -o bin/aibot ./cmd/aibot
@@ -10,6 +10,10 @@ run:
 
 test:
 	cd backend && $(GO) test ./...
+
+cover:
+	cd backend && $(GO) test ./... -covermode=atomic -coverprofile=coverage.out
+	cd backend && $(GO) tool cover -func=coverage.out | tail -1
 
 vet:
 	cd backend && $(GO) vet ./...
