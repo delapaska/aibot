@@ -1,0 +1,27 @@
+# Запуск всего приложения одной командой: docker compose up -d --build
+# Секреты берутся из .env (см. .env.example) и в git не попадают.
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aibot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aibot}
+      POSTGRES_DB: ${POSTGRES_DB:-aibot}
+    ports:
+      # наружу не публикуем: только localhost для локальной разработки
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aibot} -d ${POSTGRES_DB:-aibot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Сервис app (Go: REST API + бот) и раздача панели добавляются на
+  # финальной стадии сборки Docker-образа; пока поднимаем только БД.
+
+volumes:
+  pgdata:
