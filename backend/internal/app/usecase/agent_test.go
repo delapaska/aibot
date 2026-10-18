@@ -20,7 +20,8 @@ func newAgent(t *testing.T) (*Agent, *fakes.LLM, *fakes.Expenses) {
 	clock := fakes.Clock{T: now}
 	svc := NewExpenseService(expenses, users, clock)
 	llm := &fakes.LLM{}
-	return NewAgent(llm, svc, clock), llm, expenses
+	agent := NewAgent(llm, svc, NewDebtService(fakes.NewDebts(), users, clock), NewBudgetService(fakes.NewBudgets(), svc, clock), clock)
+	return agent, llm, expenses
 }
 
 func mustKop(t *testing.T, rubles float64) domain.Kopecks {
@@ -64,11 +65,20 @@ func TestAgentPlainAnswer(t *testing.T) {
 	if sys.Role != port.RoleSystem || !strings.Contains(sys.Content, "2026-10-18") {
 		t.Errorf("system prompt must carry today's date, got %q", sys.Content)
 	}
+	// The model must always tell the user what happened: confirm the
+	// recorded expense with its details, and show expenses from the tool
+	// answers when asked — never leave the operation unconfirmed.
+	if !strings.Contains(sys.Content, "подтверждай, что записал") {
+		t.Errorf("system prompt must require a confirmation with details, got %q", sys.Content)
+	}
+	if !strings.Contains(sys.Content, "перечисли траты из ответа") {
+		t.Errorf("system prompt must require listing expenses from the tool answer, got %q", sys.Content)
+	}
 	if req.Messages[1].Content != "привет" || req.Messages[1].Role != port.RoleUser {
 		t.Errorf("user message = %+v", req.Messages[1])
 	}
-	if len(req.Tools) != 5 {
-		t.Errorf("tools = %d, want 5", len(req.Tools))
+	if len(req.Tools) != 11 {
+		t.Errorf("tools = %d, want 11", len(req.Tools))
 	}
 }
 
@@ -190,13 +200,17 @@ func TestAgentListIsScoped(t *testing.T) {
 			ID     string  `json:"id"`
 			Amount float64 `json:"amount_rubles"`
 		} `json:"items"`
-		Total int `json:"total"`
+		TotalCount int     `json:"total_count"`
+		SumRubles  float64 `json:"sum_rubles"`
 	}
 	if err := json.Unmarshal([]byte(toolMsg.Content), &payload); err != nil {
 		t.Fatalf("tool result: %v (%q)", err, toolMsg.Content)
 	}
-	if payload.Total != 2 || len(payload.Items) != 2 {
-		t.Fatalf("total = %d, items = %d, want 2/2", payload.Total, len(payload.Items))
+	if payload.TotalCount != 2 || len(payload.Items) != 2 {
+		t.Fatalf("total_count = %d, items = %d, want 2/2", payload.TotalCount, len(payload.Items))
+	}
+	if payload.SumRubles != 470 {
+		t.Errorf("sum_rubles = %v, want 470", payload.SumRubles)
 	}
 	for _, it := range payload.Items {
 		if it.ID == "exp-3" {

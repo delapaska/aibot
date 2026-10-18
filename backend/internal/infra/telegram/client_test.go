@@ -110,8 +110,12 @@ func TestSendMessagePostsJSON(t *testing.T) {
 	c := New("TOK", testLogger(t))
 	c.base = srv.URL
 
-	if err := c.SendMessage(context.Background(), 42, "привет"); err != nil {
+	id, err := c.SendMessage(context.Background(), 42, "привет")
+	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
+	}
+	if id != 1 {
+		t.Errorf("message id = %d, want 1", id)
 	}
 	if gotPath != "/botTOK/sendMessage" {
 		t.Errorf("path = %q", gotPath)
@@ -129,7 +133,89 @@ func TestSendMessageError(t *testing.T) {
 	c := New("TOK", testLogger(t))
 	c.base = srv.URL
 
-	if err := c.SendMessage(context.Background(), 42, "привет"); err == nil || !strings.Contains(err.Error(), "chat not found") {
+	if _, err := c.SendMessage(context.Background(), 42, "привет"); err == nil || !strings.Contains(err.Error(), "chat not found") {
 		t.Fatalf("err = %v, want description", err)
+	}
+}
+
+func TestEditMessageTextPostsJSON(t *testing.T) {
+	var gotPath string
+	var gotBody struct {
+		ChatID    int64  `json:"chat_id"`
+		MessageID int64  `json:"message_id"`
+		Text      string `json:"text"`
+	}
+	srv := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.Write([]byte(`{"ok":true,"result":true}`))
+	})
+	c := New("TOK", testLogger(t))
+	c.base = srv.URL
+
+	if err := c.EditMessageText(context.Background(), 42, 7, "обновлено"); err != nil {
+		t.Fatalf("EditMessageText: %v", err)
+	}
+	if gotPath != "/botTOK/editMessageText" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if gotBody.ChatID != 42 || gotBody.MessageID != 7 || gotBody.Text != "обновлено" {
+		t.Errorf("body = %+v", gotBody)
+	}
+}
+
+func TestDeleteMessagePostsJSON(t *testing.T) {
+	var gotPath string
+	var gotBody struct {
+		ChatID    int64 `json:"chat_id"`
+		MessageID int64 `json:"message_id"`
+	}
+	srv := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.Write([]byte(`{"ok":true,"result":true}`))
+	})
+	c := New("TOK", testLogger(t))
+	c.base = srv.URL
+
+	if err := c.DeleteMessage(context.Background(), 42, 7); err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	if gotPath != "/botTOK/deleteMessage" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if gotBody.ChatID != 42 || gotBody.MessageID != 7 {
+		t.Errorf("body = %+v", gotBody)
+	}
+}
+
+func TestSendChatActionPostsJSON(t *testing.T) {
+	var gotPath string
+	var gotBody struct {
+		ChatID int64  `json:"chat_id"`
+		Action string `json:"action"`
+	}
+	srv := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.Write([]byte(`{"ok":true,"result":true}`))
+	})
+	c := New("TOK", testLogger(t))
+	c.base = srv.URL
+
+	if err := c.SendChatAction(context.Background(), 42, "typing"); err != nil {
+		t.Fatalf("SendChatAction: %v", err)
+	}
+	if gotPath != "/botTOK/sendChatAction" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if gotBody.ChatID != 42 || gotBody.Action != "typing" {
+		t.Errorf("body = %+v", gotBody)
 	}
 }

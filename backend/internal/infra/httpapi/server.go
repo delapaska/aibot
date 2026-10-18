@@ -7,6 +7,7 @@
 package httpapi
 
 import (
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -20,6 +21,8 @@ type Server struct {
 	users      *usecase.UserService
 	logger     *slog.Logger
 	panelToken string
+	// panelFS overrides the embedded panel static (tests). nil = embed.
+	panelFS fs.FS
 }
 
 // NewServer assembles the API. panelToken empty = open API.
@@ -52,10 +55,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("PATCH /api/v1/expenses/{id}", s.auth(http.HandlerFunc(s.handleUpdateExpense)))
 	mux.Handle("DELETE /api/v1/expenses/{id}", s.auth(http.HandlerFunc(s.handleDeleteExpense)))
 
-	// Everything unmatched lands here: unknown paths get a JSON 404, and
+	// Everything unmatched lands here: unknown API paths get a JSON 404,
 	// known paths hit with the wrong method get a proper 405 + Allow (the
-	// catch-all would otherwise swallow the mux's automatic 405).
-	mux.HandleFunc("/", s.catchAll)
+	// catch-all would otherwise swallow the mux's automatic 405), and
+	// non-API paths are served the embedded panel.
+	s.mountRoot(mux)
 
 	return s.securityHeaders(s.recoverer(s.accessLog(mux)))
 }

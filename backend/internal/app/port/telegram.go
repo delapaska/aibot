@@ -38,6 +38,14 @@ type TelegramAPI interface {
 	// GetUpdates returns the updates after the given offset, waiting up to
 	// timeoutSec seconds for new ones (long polling).
 	GetUpdates(ctx context.Context, offset int64, timeoutSec int) ([]TelegramUpdate, error)
-	// SendMessage delivers one text message to the chat.
-	SendMessage(ctx context.Context, chatID int64, text string) error
+	// SendMessage delivers one text message to the chat and returns the
+	// created message's id, so the caller can edit or delete it later
+	// (the progress bar does both).
+	SendMessage(ctx context.Context, chatID int64, text string) (int64, error)
+	// SendChatAction shows a chat status (e.g. "typing") in the chat.
+	SendChatAction(ctx context.Context, chatID int64, action string) error
+	// EditMessageText rewrites the text of an earlier bot message.
+	EditMessageText(ctx context.Context, chatID int64, messageID int64, text string) error
+	// DeleteMessage removes an earlier bot message.
+	DeleteMessage(ctx context.Context, chatID int64, messageID int64) error
 }

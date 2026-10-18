@@ -20,8 +20,19 @@ services:
       timeout: 5s
       retries: 10
 
-  # Сервис app (Go: REST API + бот) и раздача панели добавляются на
-  # финальной стадии сборки Docker-образа; пока поднимаем только БД.
+  # Go-приложение: REST API панели + Telegram-бот в одном процессе.
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: db
+    ports:
+      # наружу не публикуем: только localhost
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
 
 volumes:
   pgdata:

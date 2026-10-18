@@ -191,6 +191,113 @@ type Clock struct{ T time.Time }
 
 func (c Clock) Now() time.Time { return c.T }
 
+// Debts is an in-memory DebtRepository mirroring the postgres adapter:
+// user scoping, ErrNotFound for foreign or missing rows, newest first.
+type Debts struct {
+	items map[string]domain.Debt
+	seq   int
+}
+
+// NewDebts returns an empty fake repository.
+func NewDebts() *Debts { return &Debts{items: map[string]domain.Debt{}} }
+
+func (f *Debts) Create(_ context.Context, d domain.Debt) (domain.Debt, error) {
+	f.seq++
+	d.ID = fmt.Sprintf("debt-%d", f.seq)
+	f.items[d.ID] = d
+	return d, nil
+}
+
+func (f *Debts) Get(_ context.Context, userID *int64, id string) (domain.Debt, error) {
+	d, ok := f.items[id]
+	if !ok {
+		return domain.Debt{}, domain.ErrNotFound
+	}
+	if userID != nil && d.UserID != *userID {
+		return domain.Debt{}, domain.ErrNotFound
+	}
+	return d, nil
+}
+
+func (f *Debts) List(_ context.Context, fl port.DebtFilter) ([]domain.Debt, error) {
+	out := make([]domain.Debt, 0, len(f.items))
+	for _, d := range f.items {
+		if fl.UserID != nil && d.UserID != *fl.UserID {
+			continue
+		}
+		if fl.Open != nil && (d.SettledAt != nil) == *fl.Open {
+			continue
+		}
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (f *Debts) Settle(_ context.Context, userID *int64, id string, settledAt time.Time) (domain.Debt, error) {
+	d, ok := f.items[id]
+	if !ok {
+		return domain.Debt{}, domain.ErrNotFound
+	}
+	if userID != nil && d.UserID != *userID {
+		return domain.Debt{}, domain.ErrNotFound
+	}
+	if d.SettledAt != nil {
+		return domain.Debt{}, domain.ErrAlreadySettled
+	}
+	d.SettledAt = &settledAt
+	f.items[id] = d
+	return d, nil
+}
+
+// Len reports how many debts are stored (test assertions).
+func (f *Debts) Len() int { return len(f.items) }
+
+// Peek returns the stored debt by id without scoping (test assertions).
+func (f *Debts) Peek(id string) (domain.Debt, bool) {
+	d, ok := f.items[id]
+	return d, ok
+}
+
+// Put stores a debt as-is, bypassing Create (direct seeding).
+func (f *Debts) Put(d domain.Debt) { f.items[d.ID] = d }
+
+// Budgets is an in-memory BudgetRepository with postgres upsert semantics.
+type Budgets struct {
+	items map[string]domain.Budget // key: userID:category
+}
+
+// NewBudgets returns an empty fake repository.
+func NewBudgets() *Budgets { return &Budgets{items: map[string]domain.Budget{}} }
+
+func budgetKey(userID int64, cat domain.Category) string {
+	return fmt.Sprintf("%d:%s", userID, cat)
+}
+
+func (f *Budgets) Set(_ context.Context, b domain.Budget) (domain.Budget, error) {
+	f.items[budgetKey(b.UserID, b.Category)] = b
+	return b, nil
+}
+
+func (f *Budgets) Delete(_ context.Context, userID int64, cat domain.Category) error {
+	delete(f.items, budgetKey(userID, cat))
+	return nil
+}
+
+func (f *Budgets) List(_ context.Context, userID int64) ([]domain.Budget, error) {
+	out := make([]domain.Budget, 0, len(f.items))
+	for _, b := range f.items {
+		if b.UserID == userID {
+			out = append(out, b)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Category < out[j].Category })
+	return out, nil
+}
+
+// Len reports how many budgets are stored (test assertions).
+func (f *Budgets) Len() int { return len(f.items) }
+
 // LLM is a scripted port.LLM: it pops queued responses in order and
 // records every request it received, so tests can assert on what the
 // agent sent and script multi-round tool conversations.
@@ -198,12 +305,17 @@ type LLM struct {
 	Queue    []port.ChatResponse // consumed front to back
 	Err      error               // returned on every call when set
 	Requests []port.ChatRequest  // captured requests
+	Hang     bool                // block until the context is done
 }
 
-func (f *LLM) ChatComplete(_ context.Context, req port.ChatRequest) (port.ChatResponse, error) {
+func (f *LLM) ChatComplete(ctx context.Context, req port.ChatRequest) (port.ChatResponse, error) {
 	f.Requests = append(f.Requests, req)
 	if f.Err != nil {
 		return port.ChatResponse{}, f.Err
+	}
+	if f.Hang {
+		<-ctx.Done()
+		return port.ChatResponse{}, fmt.Errorf("llm: %w", ctx.Err())
 	}
 	if len(f.Queue) == 0 {
 		return port.ChatResponse{}, errors.New("fakes: LLM queue is empty")

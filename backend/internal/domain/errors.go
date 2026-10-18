@@ -15,4 +15,10 @@ var (
 	ErrInvalidCategory = errors.New("invalid category")
 	ErrInvalidDate     = errors.New("invalid date")
 	ErrInvalidComment  = errors.New("invalid comment")
+	ErrInvalidDebtor   = errors.New("invalid debtor name")
+
+	// ErrInvalidDirection is returned for an unknown debt direction.
+	ErrInvalidDirection = errors.New("invalid debt direction")
+	// ErrAlreadySettled is returned when a repaid debt is settled again.
+	ErrAlreadySettled = errors.New("debt is already settled")
 )

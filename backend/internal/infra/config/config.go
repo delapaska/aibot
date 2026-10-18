@@ -42,8 +42,16 @@ type Config struct {
 	LogLevel string // debug|info|warn|error
 }
 
-// Load reads configuration from the environment and validates it.
+// Load reads configuration from the environment and validates it. A
+// .env file (repo root or backend/) is loaded first so `make run` works
+// outside containers; real environment variables still win.
 func Load() (Config, error) {
+	for _, path := range []string{"../.env", ".env"} {
+		if err := loadDotenv(path); err != nil {
+			return Config{}, err
+		}
+	}
+
 	cfg := Config{
 		HTTPAddr:      env("HTTP_ADDR", ":8080"),
 		TelegramToken: env("TELEGRAM_TOKEN", ""),

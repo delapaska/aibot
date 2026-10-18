@@ -112,7 +112,7 @@ func maintenanceDSN(dsn string) (string, string, error) {
 func setup(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	t.Cleanup(func() {
-		_, err := testPool.Exec(context.Background(), "TRUNCATE expenses, users CASCADE")
+		_, err := testPool.Exec(context.Background(), "TRUNCATE expenses, budgets, debts, users CASCADE")
 		if err != nil {
 			t.Errorf("cleanup truncate: %v", err)
 		}

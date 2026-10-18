@@ -27,9 +27,14 @@
 
 - `make build` — собрать бэкенд в `backend/bin/aibot`
 - `make test` — все тесты бэкенда
+- `make test-panel` — тесты фронтенда (vitest)
+- `make panel` — собрать фронтенд и встроить в Go-бинарник (`backend/internal/infra/httpapi/dist/app`; требует node)
 - `make run` — запустить локально (нужен `.env`; БД — `docker compose up -d db`)
 - `make vet`, `make fmt` — линт и форматирование
 - `make docker-up` / `make docker-down` — поднять/остановить весь стек
+
+Без `make panel` бинарник собирается и работает: по `/` отдаётся
+страница-заглушка «панель не собрана», API и бот полностью функциональны.
 
 ## Архитектурные правила
 

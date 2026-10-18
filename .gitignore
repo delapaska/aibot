@@ -6,6 +6,8 @@ backend/bin/
 backend/coverage.out
 frontend/node_modules/
 frontend/dist/
+# Встроенная панель: появляется после make panel / docker build
+backend/internal/infra/httpapi/dist/app/
 
 # Служебное
 *.log

@@ -90,24 +90,80 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSec int) (
 	return updates, nil
 }
 
-// SendMessage delivers one text message.
-func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) error {
+// SendMessage delivers one text message and returns the created message
+// id, so the caller can edit or delete it later.
+func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) (int64, error) {
 	body, err := json.Marshal(struct {
 		ChatID int64  `json:"chat_id"`
 		Text   string `json:"text"`
 	}{ChatID: chatID, Text: text})
 	if err != nil {
-		return fmt.Errorf("telegram: encode message: %w", err)
+		return 0, fmt.Errorf("telegram: encode message: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.base+"/bot"+c.token+"/sendMessage", bytes.NewReader(body))
+	if err != nil {
+		return 0, fmt.Errorf("telegram: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("telegram: sendMessage: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := readBody(resp)
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return 0, fmt.Errorf("telegram: decode sendMessage: %w", err)
+	}
+	if !out.OK {
+		return 0, fmt.Errorf("telegram: sendMessage: %s", out.Description)
+	}
+	return out.Result.MessageID, nil
+}
+
+// EditMessageText rewrites the text of an earlier bot message.
+func (c *Client) EditMessageText(ctx context.Context, chatID int64, messageID int64, text string) error {
+	return c.mutateMessage(ctx, "editMessageText", struct {
+		ChatID    int64  `json:"chat_id"`
+		MessageID int64  `json:"message_id"`
+		Text      string `json:"text"`
+	}{ChatID: chatID, MessageID: messageID, Text: text})
+}
+
+// DeleteMessage removes an earlier bot message.
+func (c *Client) DeleteMessage(ctx context.Context, chatID int64, messageID int64) error {
+	return c.mutateMessage(ctx, "deleteMessage", struct {
+		ChatID    int64 `json:"chat_id"`
+		MessageID int64 `json:"message_id"`
+	}{ChatID: chatID, MessageID: messageID})
+}
+
+// mutateMessage posts a message-mutating call and checks the ok-envelope.
+func (c *Client) mutateMessage(ctx context.Context, method string, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("telegram: encode %s: %w", method, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.base+"/bot"+c.token+"/"+method, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("telegram: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("telegram: sendMessage: %w", err)
+		return fmt.Errorf("telegram: %s: %w", method, err)
 	}
 	defer resp.Body.Close()
 
@@ -120,10 +176,48 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) err
 		Description string `json:"description"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return fmt.Errorf("telegram: decode sendMessage: %w", err)
+		return fmt.Errorf("telegram: decode %s: %w", method, err)
 	}
 	if !out.OK {
-		return fmt.Errorf("telegram: sendMessage: %s", out.Description)
+		return fmt.Errorf("telegram: %s: %s", method, out.Description)
+	}
+	return nil
+}
+
+// SendChatAction shows a chat status (e.g. "typing") in the chat.
+func (c *Client) SendChatAction(ctx context.Context, chatID int64, action string) error {
+	body, err := json.Marshal(struct {
+		ChatID int64  `json:"chat_id"`
+		Action string `json:"action"`
+	}{ChatID: chatID, Action: action})
+	if err != nil {
+		return fmt.Errorf("telegram: encode chat action: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.base+"/bot"+c.token+"/sendChatAction", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("telegram: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram: sendChatAction: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := readBody(resp)
+	if err != nil {
+		return err
+	}
+	var out struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return fmt.Errorf("telegram: decode sendChatAction: %w", err)
+	}
+	if !out.OK {
+		return fmt.Errorf("telegram: sendChatAction: %s", out.Description)
 	}
 	return nil
 }

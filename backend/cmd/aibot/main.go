@@ -74,13 +74,17 @@ func run() error {
 	// Application layer: use cases over ports.
 	expenseRepo := postgres.NewExpenseRepo(pool)
 	userRepo := postgres.NewUserRepo(pool)
+	debtRepo := postgres.NewDebtRepo(pool)
+	budgetRepo := postgres.NewBudgetRepo(pool)
 	clock := clocksys.New(cfg.Location)
 	expenses := usecase.NewExpenseService(expenseRepo, userRepo, clock)
 	users := usecase.NewUserService(userRepo, clock)
+	debts := usecase.NewDebtService(debtRepo, userRepo, clock)
+	budgets := usecase.NewBudgetService(budgetRepo, expenses, clock)
 
-	// LLM agent over the expense service.
+	// LLM agent over the expense, debt and budget services.
 	llmClient := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel, logger)
-	agent := usecase.NewAgent(llmClient, expenses, clock)
+	agent := usecase.NewAgent(llmClient, expenses, debts, budgets, clock)
 
 	// HTTP API of the panel.
 	api := httpapi.NewServer(expenses, users, logger, cfg.PanelToken)

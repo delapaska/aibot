@@ -31,14 +31,24 @@ const (
 
 // User-facing replies, in Russian per the project conventions.
 const (
-	msgBotRateLimit  = "Слишком много сообщений, подожди минуту."
-	msgBotTooLong    = "Сообщение слишком длинное, раздели его на части."
-	msgBotNotText    = "Я понимаю только текстовые сообщения."
-	msgBotTooComplex = "Слишком сложный запрос, попробуй разбить его на шаги."
-	msgBotInternal   = "Не получилось обработать запрос, попробуй ещё раз."
+	msgBotRateLimit      = "Слишком много сообщений, подожди минуту."
+	msgBotTooLong        = "Сообщение слишком длинное, раздели его на части."
+	msgBotNotText        = "Я понимаю только текстовые сообщения."
+	msgBotTooComplex     = "Слишком сложный запрос, попробуй разбить его на шаги."
+	msgBotInternal       = "Не получилось обработать запрос, попробуй ещё раз."
+	msgBotUnknownCommand = "Не знаю такую команду. Команды: /start, /help."
+	msgBotTimeout        = "Запрос обрабатывался слишком долго, и я не успел ответить. Попробуй ещё раз."
 )
 
-const botGreeting = "Привет! Я помогаю вести семейные расходы. Пиши траты текстом — например «кофе 350» или «вчера такси 520» — и я запишу. Можно спросить: «покажи расходы за неделю», «сколько потратил на еду в этом месяце»."
+// botHelp is the /start and /help reply: what the bot can do, with
+// copyable examples.
+const botHelp = "Привет! Я веду семейные расходы. Что я умею:\n\n" +
+	"• Записывать траты: «кофе 350», «вчера такси 520», «продукты 1200 в пятницу»\n" +
+	"• Показывать и подводить итоги: «покажи расходы за неделю», «сколько потратил на еду за месяц»\n" +
+	"• Изменять и удалять: «измени последнюю трату на 400», «удали трату про кофе»\n" +
+	"• Долги: «Егор взял у меня в долг 500», «какие у меня долги», «Егор вернул долг»\n" +
+	"• Лимиты: «поставь лимит на еду 20000 в месяц», «мои лимиты» — я предупрежу, когда лимит близко\n\n" +
+	"Команды: /start — эта справка, /help — то же самое."
 
 // BotService turns Telegram updates into agent conversations.
 type BotService struct {
@@ -98,7 +108,12 @@ func (s *BotService) HandleUpdate(ctx context.Context, u port.TelegramUpdate) []
 		return []string{msgBotNotText}
 	}
 	if strings.HasPrefix(text, "/") {
-		return []string{botGreeting}
+		switch strings.ToLower(strings.Fields(text)[0]) {
+		case "/start", "/help":
+			return []string{botHelp}
+		default:
+			return []string{msgBotUnknownCommand}
+		}
 	}
 	if utf8.RuneCountInString(text) > maxBotInputLen {
 		return []string{msgBotTooLong}
@@ -109,12 +124,20 @@ func (s *BotService) HandleUpdate(ctx context.Context, u port.TelegramUpdate) []
 		switch {
 		case errors.Is(err, ErrAgentLimit):
 			return []string{msgBotTooComplex}
+		case errors.Is(err, context.DeadlineExceeded):
+			// The update's own deadline, not a shutdown: the user is
+			// still waiting and must hear that the answer is not coming.
+			return []string{msgBotTimeout}
 		case ctx.Err() != nil:
 			return nil // shutting down, nobody is listening
 		default:
 			s.logger.Error("agent handle", "error", err, "telegram_id", user.ID)
 			return []string{msgBotInternal}
 		}
+	}
+	if strings.TrimSpace(reply) == "" {
+		// A silent bot looks broken; the model returned nothing usable.
+		return []string{msgBotInternal}
 	}
 	return splitReply(reply, maxBotReplyLen)
 }

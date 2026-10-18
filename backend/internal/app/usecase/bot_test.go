@@ -1,6 +1,7 @@
 package usecase
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -22,7 +23,8 @@ func newBot(t *testing.T, allowed []int64) (*BotService, *fakes.Users, *fakes.Ex
 	expenses := fakes.NewExpenses()
 	clock := &fakes.Clock{T: now}
 	llm := &fakes.LLM{}
-	agent := NewAgent(llm, NewExpenseService(expenses, users, clock), clock)
+	svc := NewExpenseService(expenses, users, clock)
+	agent := NewAgent(llm, svc, NewDebtService(fakes.NewDebts(), users, clock), NewBudgetService(fakes.NewBudgets(), svc, clock), clock)
 	bot := NewBotService(NewUserService(users, clock), agent, clock, allowed, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return bot, users, expenses, llm, clock
 }
@@ -116,7 +118,7 @@ func TestBotOpenWhenAllowListEmpty(t *testing.T) {
 
 	replies := bot.HandleUpdate(ctx, tgUpdate(1, 42, "private", "/start"))
 
-	if len(replies) != 1 || replies[0] != botGreeting {
+	if len(replies) != 1 || replies[0] != botHelp {
 		t.Fatalf("replies = %v", replies)
 	}
 	if users.Len() != 1 {
@@ -199,7 +201,7 @@ func TestBotCommandGetsGreeting(t *testing.T) {
 
 	replies := bot.HandleUpdate(ctx, tgUpdate(1, 42, "private", "/start"))
 
-	if len(replies) != 1 || replies[0] != botGreeting {
+	if len(replies) != 1 || replies[0] != botHelp {
 		t.Fatalf("replies = %v", replies)
 	}
 	if len(llm.Requests) != 0 {
@@ -207,6 +209,32 @@ func TestBotCommandGetsGreeting(t *testing.T) {
 	}
 	if users.Len() != 1 {
 		t.Fatalf("users.Len() = %d, want 1 (member registered even by /start)", users.Len())
+	}
+}
+
+func TestBotHelpCommand(t *testing.T) {
+	bot, _, _, llm, _ := newBot(t, nil)
+
+	replies := bot.HandleUpdate(ctx, tgUpdate(1, 42, "private", "/help"))
+
+	if len(replies) != 1 || replies[0] != botHelp {
+		t.Fatalf("replies = %v", replies)
+	}
+	if len(llm.Requests) != 0 {
+		t.Fatalf("llm requests = %d, want 0", len(llm.Requests))
+	}
+}
+
+func TestBotUnknownCommand(t *testing.T) {
+	bot, _, _, llm, _ := newBot(t, nil)
+
+	replies := bot.HandleUpdate(ctx, tgUpdate(1, 42, "private", "/party"))
+
+	if len(replies) != 1 || replies[0] != msgBotUnknownCommand {
+		t.Fatalf("replies = %v", replies)
+	}
+	if len(llm.Requests) != 0 {
+		t.Fatalf("llm requests = %d, want 0", len(llm.Requests))
 	}
 }
 
@@ -253,13 +281,45 @@ func TestBotLongReplyIsChunked(t *testing.T) {
 	}
 }
 
-func TestBotEmptyReplyIsSilent(t *testing.T) {
+// The model sometimes returns an empty final answer (weak/free tiers do
+// this after tool rounds). Silence would look like the bot ignored the
+// message, so the user gets an apology instead.
+func TestBotEmptyReplyApologizes(t *testing.T) {
 	bot, _, _, llm, _ := newBot(t, nil)
 	llm.Queue = []port.ChatResponse{{Content: "   "}}
 
 	replies := bot.HandleUpdate(ctx, tgUpdate(1, 42, "private", "привет"))
 
+	if len(replies) != 1 || replies[0] != msgBotInternal {
+		t.Fatalf("replies = %v, want the internal-error apology", replies)
+	}
+}
+
+// The agent outliving its deadline must not stay silent either: the user
+// waited for the answer and deserves to know it did not arrive.
+func TestBotTimeoutReply(t *testing.T) {
+	bot, _, _, llm, _ := newBot(t, nil)
+	llm.Hang = true
+
+	hctx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer cancel()
+	replies := bot.HandleUpdate(hctx, tgUpdate(1, 42, "private", "покажи траты за неделю"))
+
+	if len(replies) != 1 || replies[0] != msgBotTimeout {
+		t.Fatalf("replies = %v, want the timeout apology", replies)
+	}
+}
+
+// A cancelled context is a shutdown, not a timeout: stay silent.
+func TestBotShutdownIsSilent(t *testing.T) {
+	bot, _, _, llm, _ := newBot(t, nil)
+	llm.Hang = true
+
+	hctx, cancel := context.WithCancel(ctx)
+	cancel()
+	replies := bot.HandleUpdate(hctx, tgUpdate(1, 42, "private", "покажи траты"))
+
 	if replies != nil {
-		t.Fatalf("replies = %v, want none", replies)
+		t.Fatalf("replies = %v, want none on shutdown", replies)
 	}
 }
