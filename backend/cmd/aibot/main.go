@@ -7,12 +7,20 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/delapaska/aibot/internal/app/usecase"
+	"github.com/delapaska/aibot/internal/infra/clocksys"
 	"github.com/delapaska/aibot/internal/infra/config"
+	"github.com/delapaska/aibot/internal/infra/httpapi"
+	"github.com/delapaska/aibot/internal/infra/postgres"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
@@ -47,11 +55,59 @@ func run() error {
 		"tz", cfg.Location.String(),
 	)
 
-	// Scaffold stage: nothing to serve yet. Later stages start the HTTP
-	// server and the Telegram bot here; for now just wait for shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
+
+	// Storage: fail fast on an unreachable database — the service is
+	// useless without it.
+	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN)
+	if err != nil {
+		return fmt.Errorf("open postgres: %w", err)
+	}
+	defer pool.Close()
+	if err := postgres.RunMigrations(ctx, pool); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+
+	// Application layer: use cases over ports.
+	expenseRepo := postgres.NewExpenseRepo(pool)
+	userRepo := postgres.NewUserRepo(pool)
+	clock := clocksys.New(cfg.Location)
+	expenses := usecase.NewExpenseService(expenseRepo, userRepo, clock)
+	users := usecase.NewUserService(userRepo, clock)
+
+	// HTTP API of the panel.
+	api := httpapi.NewServer(expenses, users, logger, cfg.PanelToken)
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           api.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		logger.Info("http server listening", "addr", cfg.HTTPAddr)
+		errCh <- srv.ListenAndServe()
+	}()
+
+	// The Telegram bot is added in a later stage.
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("http server: %w", err)
+		}
+	case <-ctx.Done():
+	}
+
+	// Graceful shutdown: stop accepting, finish in-flight requests.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("http shutdown", "error", err)
+	}
 
 	logger.Info("shutdown complete")
 	return nil

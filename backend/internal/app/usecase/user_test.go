@@ -4,12 +4,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/delapaska/aibot/internal/app/port/fakes"
 	"github.com/delapaska/aibot/internal/domain"
 )
 
 func TestEnsureCreatesStubUser(t *testing.T) {
-	users := newFakeUsers()
-	svc := NewUserService(users, fakeClock{now})
+	users := fakes.NewUsers()
+	svc := NewUserService(users, fakes.Clock{T: now})
 
 	u, err := svc.Ensure(ctx, 42)
 	if err != nil {
@@ -24,27 +25,31 @@ func TestEnsureCreatesStubUser(t *testing.T) {
 }
 
 func TestEnsureIsIdempotent(t *testing.T) {
-	users := newFakeUsers()
-	svc := NewUserService(users, fakeClock{now})
+	users := fakes.NewUsers()
+	svc := NewUserService(users, fakes.Clock{T: now})
 
 	if _, err := svc.Ensure(ctx, 42); err != nil {
 		t.Fatal(err)
 	}
-	later := NewUserService(users, fakeClock{now.Add(time.Hour)})
+	later := NewUserService(users, fakes.Clock{T: now.Add(time.Hour)})
 	if _, err := later.Ensure(ctx, 42); err != nil {
 		t.Fatal(err)
 	}
-	if len(users.byID) != 1 {
-		t.Errorf("users = %d, want 1", len(users.byID))
+	if users.Len() != 1 {
+		t.Errorf("users = %d, want 1", users.Len())
 	}
-	if !users.byID[42].CreatedAt.Equal(now) {
+	kept, ok := users.Get(42)
+	if !ok {
+		t.Fatal("user disappeared")
+	}
+	if !kept.CreatedAt.Equal(now) {
 		t.Error("original CreatedAt must be preserved")
 	}
 }
 
 func TestEnsureProfileUpdatesNames(t *testing.T) {
-	users := newFakeUsers()
-	svc := NewUserService(users, fakeClock{now})
+	users := fakes.NewUsers()
+	svc := NewUserService(users, fakes.Clock{T: now})
 
 	if _, err := svc.Ensure(ctx, 42); err != nil {
 		t.Fatal(err)
@@ -63,8 +68,8 @@ func TestEnsureProfileUpdatesNames(t *testing.T) {
 }
 
 func TestListUsers(t *testing.T) {
-	users := newFakeUsers()
-	svc := NewUserService(users, fakeClock{now})
+	users := fakes.NewUsers()
+	svc := NewUserService(users, fakes.Clock{T: now})
 
 	for _, id := range []int64{42, 7, 100} {
 		if _, err := svc.Ensure(ctx, id); err != nil {

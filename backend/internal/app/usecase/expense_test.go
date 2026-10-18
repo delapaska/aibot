@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/delapaska/aibot/internal/app/port"
+	"github.com/delapaska/aibot/internal/app/port/fakes"
 	"github.com/delapaska/aibot/internal/domain"
 )
 
@@ -16,11 +17,11 @@ var (
 	loc = time.UTC
 )
 
-func newService(t *testing.T) (*ExpenseService, *fakeExpenses, *fakeUsers) {
+func newService(t *testing.T) (*ExpenseService, *fakes.Expenses, *fakes.Users) {
 	t.Helper()
-	expenses := newFakeExpenses()
-	users := newFakeUsers()
-	svc := NewExpenseService(expenses, users, fakeClock{now})
+	expenses := fakes.NewExpenses()
+	users := fakes.NewUsers()
+	svc := NewExpenseService(expenses, users, fakes.Clock{T: now})
 	return svc, expenses, users
 }
 
@@ -55,15 +56,15 @@ func TestCreateStoresExpenseAndRegistersUser(t *testing.T) {
 
 	// The owner is registered automatically: the panel may create expenses
 	// for a member who has never written to the bot.
-	u, ok := users.byID[42]
+	u, ok := users.Get(42)
 	if !ok {
 		t.Fatal("user was not registered")
 	}
 	if !u.CreatedAt.Equal(now) {
 		t.Errorf("stub user CreatedAt = %v, want %v", u.CreatedAt, now)
 	}
-	if len(expenses.items) != 1 {
-		t.Errorf("stored %d expenses, want 1", len(expenses.items))
+	if expenses.Len() != 1 {
+		t.Errorf("stored %d expenses, want 1", expenses.Len())
 	}
 }
 
@@ -79,7 +80,7 @@ func TestCreateRejectsInvalidInputWithoutSideEffects(t *testing.T) {
 	if !errors.Is(err, domain.ErrInvalidAmount) {
 		t.Fatalf("error = %v, want ErrInvalidAmount", err)
 	}
-	if len(expenses.items) != 0 || len(users.byID) != 0 {
+	if expenses.Len() != 0 || users.Len() != 0 {
 		t.Error("invalid input must not touch storage or users")
 	}
 }
@@ -148,7 +149,7 @@ func TestUpdateForeignScopeRejected(t *testing.T) {
 		t.Fatalf("foreign update error = %v, want ErrNotFound", err)
 	}
 	// The entity is untouched.
-	if expenses.items[created.ID].Amount != 35000 {
+	if got, _ := expenses.Peek(created.ID); got.Amount != 35000 {
 		t.Error("foreign update must not modify the expense")
 	}
 }
@@ -166,7 +167,7 @@ func TestUpdateInvalidValueKeepsEntity(t *testing.T) {
 	if _, err := svc.Update(ctx, &created.UserID, created.ID, UpdateInput{Amount: &zero}); !errors.Is(err, domain.ErrInvalidAmount) {
 		t.Fatalf("error = %v, want ErrInvalidAmount", err)
 	}
-	if expenses.items[created.ID].Amount != 35000 {
+	if got, _ := expenses.Peek(created.ID); got.Amount != 35000 {
 		t.Error("rejected update must not modify the expense")
 	}
 }
@@ -187,7 +188,7 @@ func TestDeleteScoping(t *testing.T) {
 	if err := svc.Delete(ctx, &created.UserID, created.ID); err != nil {
 		t.Fatalf("owner delete: %v", err)
 	}
-	if len(expenses.items) != 0 {
+	if expenses.Len() != 0 {
 		t.Error("expense must be removed")
 	}
 }
