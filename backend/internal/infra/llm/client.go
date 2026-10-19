@@ -15,21 +15,29 @@ import (
 	"time"
 
 	"github.com/delapaska/aibot/internal/app/port"
+	"github.com/delapaska/aibot/internal/infra/httpclient"
 )
 
 const (
-	maxRetries  = 2 // extra attempts after the first one
-	maxErrBody  = 4 << 10
+	maxRetries = 2 // extra attempts after the first one
+	// Cap on a provider response body: big enough for any real reply,
+	// small enough to bound memory on a runaway server.
+	maxRespBody = 16 << 20
 	chatTimeout = 90 * time.Second
+	// A retry that starts with less than this much of the parent
+	// deadline left cannot finish: it would only burn the remaining
+	// seconds and die on the deadline anyway.
+	minRetryBudget = 15 * time.Second
 )
 
 // Client talks to an OpenAI-compatible endpoint.
 type Client struct {
-	baseURL string
-	apiKey  string
-	model   string
-	hc      *http.Client
-	logger  *slog.Logger
+	baseURL   string
+	apiKey    string
+	model     string
+	fallbacks []string
+	hc        *http.Client
+	logger    *slog.Logger
 
 	// wait pauses before retry attempt n (1-based); replaced in tests.
 	wait func(n int) time.Duration
@@ -44,17 +52,24 @@ func New(baseURL, apiKey, model string, logger *slog.Logger) *Client {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
 		model:   model,
-		hc:      &http.Client{Timeout: chatTimeout},
+		hc:      httpclient.New(chatTimeout),
 		logger:  logger,
 		wait:    func(n int) time.Duration { return time.Duration(n) * time.Second },
 	}
+}
+
+// WithFallbacks sets alternate models OpenRouter should try when the
+// primary is unavailable (rate-limited, down). Call before ChatComplete.
+func (c *Client) WithFallbacks(models []string) *Client {
+	c.fallbacks = models
+	return c
 }
 
 // ChatComplete performs one chat completion round-trip. Transient
 // failures (429, 5xx) are retried with a linear backoff: free-tier
 // providers rate-limit aggressively.
 func (c *Client) ChatComplete(ctx context.Context, req port.ChatRequest) (port.ChatResponse, error) {
-	body, err := json.Marshal(toWireRequest(c.model, req))
+	body, err := json.Marshal(toWireRequest(c.model, c.fallbacks, req))
 	if err != nil {
 		return port.ChatResponse{}, fmt.Errorf("llm: encode request: %w", err)
 	}
@@ -62,10 +77,20 @@ func (c *Client) ChatComplete(ctx context.Context, req port.ChatRequest) (port.C
 	for attempt := 0; ; attempt++ {
 		resp, err := c.do(ctx, body)
 		if err == nil {
-			return resp, nil
+			if resp.Content != "" || len(resp.ToolCalls) > 0 {
+				return resp, nil
+			}
+			// Free models sometimes return a blank message. A silent
+			// reply looks like a broken bot, so treat it as transient
+			// and retry while the budget allows.
+			err = &retryableError{err: errors.New("llm: empty response")}
 		}
 		var retryable *retryableError
 		if !errors.As(err, &retryable) || attempt >= maxRetries {
+			return port.ChatResponse{}, err
+		}
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < minRetryBudget {
+			// Not enough budget left for another attempt to finish.
 			return port.ChatResponse{}, err
 		}
 		delay := c.wait(attempt + 1)
@@ -107,7 +132,7 @@ func (c *Client) do(ctx context.Context, body []byte) (port.ChatResponse, error)
 	}
 	defer httpResp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(httpResp.Body, maxErrBody))
+	respBody, err := io.ReadAll(io.LimitReader(httpResp.Body, maxRespBody))
 	if err != nil {
 		return port.ChatResponse{}, fmt.Errorf("llm: read response: %w", err)
 	}
@@ -126,7 +151,10 @@ func (c *Client) do(ctx context.Context, body []byte) (port.ChatResponse, error)
 
 	var wire wireResponse
 	if err := json.Unmarshal(respBody, &wire); err != nil {
-		return port.ChatResponse{}, fmt.Errorf("llm: decode response: %w", err)
+		// A body cut off mid-JSON comes from a dropped connection or a
+		// provider hiccup, not from a deterministic bug — retry it like
+		// any other transient failure.
+		return port.ChatResponse{}, &retryableError{err: fmt.Errorf("llm: decode response: %w", err)}
 	}
 	if len(wire.Choices) == 0 {
 		return port.ChatResponse{}, errors.New("llm: empty choices in response")
@@ -156,8 +184,14 @@ func excerpt(body []byte) string {
 	return strings.TrimSpace(s)
 }
 
-func toWireRequest(model string, req port.ChatRequest) wireRequest {
+func toWireRequest(model string, fallbacks []string, req port.ChatRequest) wireRequest {
 	wr := wireRequest{Model: model}
+	if len(fallbacks) > 0 {
+		// OpenRouter: "models" is the ordered routing list; the primary
+		// goes first so it is tried before the alternates. Other
+		// OpenAI-compatible endpoints ignore the field.
+		wr.Models = append([]string{model}, fallbacks...)
+	}
 	for _, m := range req.Messages {
 		wm := wireMessage{Role: string(m.Role), Content: m.Content, ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {
@@ -196,6 +230,7 @@ func fromWire(m wireMessage) port.ChatResponse {
 
 type wireRequest struct {
 	Model    string        `json:"model"`
+	Models   []string      `json:"models,omitempty"`
 	Messages []wireMessage `json:"messages"`
 	Tools    []wireTool    `json:"tools,omitempty"`
 }

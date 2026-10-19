@@ -97,8 +97,9 @@ func TestGetUpdatesHTTPError(t *testing.T) {
 func TestSendMessagePostsJSON(t *testing.T) {
 	var gotPath string
 	var gotBody struct {
-		ChatID int64  `json:"chat_id"`
-		Text   string `json:"text"`
+		ChatID    int64  `json:"chat_id"`
+		Text      string `json:"text"`
+		ParseMode string `json:"parse_mode"`
 	}
 	srv := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
@@ -123,6 +124,31 @@ func TestSendMessagePostsJSON(t *testing.T) {
 	if gotBody.ChatID != 42 || gotBody.Text != "привет" {
 		t.Errorf("body = %+v", gotBody)
 	}
+	if gotBody.ParseMode != "HTML" {
+		t.Errorf("parse_mode = %q, want HTML", gotBody.ParseMode)
+	}
+}
+
+func TestSendMessageRendersMarkdown(t *testing.T) {
+	var gotBody struct {
+		Text string `json:"text"`
+	}
+	srv := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+	})
+	c := New("TOK", testLogger(t))
+	c.base = srv.URL
+
+	if _, err := c.SendMessage(context.Background(), 42, "## Траты\n**Еда** — 350"); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	want := "<b>Траты</b>\n<b>Еда</b> — 350"
+	if gotBody.Text != want {
+		t.Errorf("text = %q, want %q", gotBody.Text, want)
+	}
 }
 
 func TestSendMessageError(t *testing.T) {
@@ -144,6 +170,7 @@ func TestEditMessageTextPostsJSON(t *testing.T) {
 		ChatID    int64  `json:"chat_id"`
 		MessageID int64  `json:"message_id"`
 		Text      string `json:"text"`
+		ParseMode string `json:"parse_mode"`
 	}
 	srv := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
@@ -163,6 +190,9 @@ func TestEditMessageTextPostsJSON(t *testing.T) {
 	}
 	if gotBody.ChatID != 42 || gotBody.MessageID != 7 || gotBody.Text != "обновлено" {
 		t.Errorf("body = %+v", gotBody)
+	}
+	if gotBody.ParseMode != "HTML" {
+		t.Errorf("parse_mode = %q, want HTML", gotBody.ParseMode)
 	}
 }
 

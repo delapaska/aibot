@@ -66,6 +66,12 @@ func mapError(err error) (int, string) {
 		return http.StatusBadRequest, "invalid_comment"
 	case errors.Is(err, domain.ErrInvalidName):
 		return http.StatusBadRequest, "invalid_name"
+	case errors.Is(err, domain.ErrInvalidDebtor):
+		return http.StatusBadRequest, "invalid_debtor"
+	case errors.Is(err, domain.ErrInvalidDirection):
+		return http.StatusBadRequest, "invalid_direction"
+	case errors.Is(err, domain.ErrAlreadySettled):
+		return http.StatusConflict, "already_settled"
 	default:
 		return http.StatusInternalServerError, "internal"
 	}

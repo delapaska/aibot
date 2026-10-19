@@ -1,7 +1,6 @@
 package usecase
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -111,38 +110,41 @@ func TestAgentListDebtsTotals(t *testing.T) {
 		{Content: "Вот твои долги"},
 	}
 
-	if _, err := agent.Handle(ctx, 42, "какие долги открыты"); err != nil {
+	got, err := agent.Handle(ctx, 42, "какие долги открыты")
+	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	toolMsg := lastToolMessage(t, llm.Requests[1])
-	var payload struct {
-		Items []struct {
-			ID        string  `json:"id"`
-			Direction string  `json:"direction"`
-			Debtor    string  `json:"debtor"`
-			Amount    float64 `json:"amount_rubles"`
-			Settled   bool    `json:"settled"`
-		} `json:"items"`
-		TotalOwesMe float64 `json:"total_owes_me_rubles"`
-		TotalIOwe   float64 `json:"total_i_owe_rubles"`
+	// The debts list is rendered locally: no ids, no English labels, and
+	// precomputed totals the model cannot swap.
+	want := "Долги:\n" +
+		"Мне должны:\n" +
+		"1. Егор — 500 ₽\n" +
+		"Я должен:\n" +
+		"1. Папа — 1 000 ₽\n" +
+		"Итого: мне должны 500 ₽, я должен 1 000 ₽."
+	if got != want {
+		t.Fatalf("answer = %q, want %q", got, want)
 	}
-	if err := json.Unmarshal([]byte(toolMsg.Content), &payload); err != nil {
-		t.Fatalf("tool result: %v (%q)", err, toolMsg.Content)
+	if len(llm.Requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (local render, no second round)", len(llm.Requests))
 	}
-	// Only this user's debts; totals are precomputed, open ones only.
-	if payload.TotalOwesMe != 500 || payload.TotalIOwe != 1000 {
-		t.Fatalf("totals = %v/%v, want 500/1000 (open only)", payload.TotalOwesMe, payload.TotalIOwe)
+}
+
+func TestAgentListDebtsEmpty(t *testing.T) {
+	agent, llm, _, _, _ := newFullAgent(t)
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{ID: "c1", Name: "list_debts", ArgsJSON: `{}`}}},
 	}
-	if len(payload.Items) != 2 {
-		t.Fatalf("items = %d, want 2 (open only)", len(payload.Items))
+
+	got, err := agent.Handle(ctx, 42, "какие долги открыты")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
 	}
-	for _, it := range payload.Items {
-		if it.ID == "debt-4" {
-			t.Error("another member's debt leaked into the tool result")
-		}
-		if it.Settled {
-			t.Error("settled debts must not appear in the open list")
-		}
+	if got != "Открытых долгов нет." {
+		t.Fatalf("answer = %q, want the empty-debts line", got)
+	}
+	if len(llm.Requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(llm.Requests))
 	}
 }
 
@@ -151,29 +153,84 @@ func TestAgentRepayDebtFlow(t *testing.T) {
 	seedDebt(t, debts, "debt-1", 42, domain.DebtOwesMe, "Егор", 50000, false)
 
 	llm.Queue = []port.ChatResponse{
-		{ToolCalls: []port.ToolCall{{ID: "c1", Name: "repay_debt", ArgsJSON: `{"debt_id":"debt-1"}`}}},
-		{Content: "Отметила: долг Егора закрыт"},
+		{ToolCalls: []port.ToolCall{{ID: "c1", Name: "repay_debt", ArgsJSON: `{"debtor":"Егор"}`}}},
 	}
 
-	if _, err := agent.Handle(ctx, 42, "Егор вернул долг"); err != nil {
+	got, err := agent.Handle(ctx, 42, "Егор вернул долг")
+	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	stored, _ := debts.Peek("debt-1")
 	if stored.SettledAt == nil {
 		t.Fatal("SettledAt = nil, want set")
 	}
+	// Repay works by name: one round, local confirmation.
+	if got != "Долг закрыт: Егор — 500 ₽." {
+		t.Errorf("answer = %q", got)
+	}
+	if len(llm.Requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (no id lookup round)", len(llm.Requests))
+	}
 
-	// A foreign debt is not found (no existence leak).
+	// A foreign debtor is not found: the error goes back to the model,
+	// so this round still spends a second LLM call.
 	llm.Queue = []port.ChatResponse{
-		{ToolCalls: []port.ToolCall{{ID: "c2", Name: "repay_debt", ArgsJSON: `{"debt_id":"debt-9"}`}}},
+		{ToolCalls: []port.ToolCall{{ID: "c2", Name: "repay_debt", ArgsJSON: `{"debtor":"Чужой"}`}}},
 		{Content: "Не нашла такой долг"},
 	}
-	if _, err := agent.Handle(ctx, 42, "закрой долг debt-9"); err != nil {
+	if _, err := agent.Handle(ctx, 42, "закрой долг Чужого"); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	toolMsg := lastToolMessage(t, llm.Requests[3])
+	toolMsg := lastToolMessage(t, llm.Requests[2])
 	if !containsJSONError(toolMsg.Content) {
-		t.Errorf("repay of a missing debt must surface an error, got %q", toolMsg.Content)
+		t.Errorf("repay of a missing debtor must surface an error, got %q", toolMsg.Content)
+	}
+}
+
+func TestAgentRepayAmbiguousDebtAsksForAmount(t *testing.T) {
+	agent, llm, _, debts, _ := newFullAgent(t)
+	seedDebt(t, debts, "debt-1", 42, domain.DebtOwesMe, "Егор", 20000, false)
+	seedDebt(t, debts, "debt-2", 42, domain.DebtOwesMe, "Егор", 25000, false)
+
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{ID: "c1", Name: "repay_debt", ArgsJSON: `{"debtor":"Егор"}`}}},
+		{Content: "У Егора два долга — уточни, какой закрыть"},
+	}
+
+	if _, err := agent.Handle(ctx, 42, "закрой долг Егора"); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	// Nothing settled yet: two open debts of the same person is
+	// ambiguous without an amount.
+	for _, id := range []string{"debt-1", "debt-2"} {
+		if d, _ := debts.Peek(id); d.SettledAt != nil {
+			t.Errorf("%s settled without disambiguation", id)
+		}
+	}
+	toolMsg := lastToolMessage(t, llm.Requests[1])
+	if !containsJSONError(toolMsg.Content) {
+		t.Errorf("ambiguity must reach the model as an error, got %q", toolMsg.Content)
+	}
+	if !strings.Contains(toolMsg.Content, "200") || !strings.Contains(toolMsg.Content, "250") {
+		t.Errorf("the error must list the amounts to pick from, got %q", toolMsg.Content)
+	}
+
+	// With an amount the same request settles the matching debt.
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{ID: "c2", Name: "repay_debt", ArgsJSON: `{"debtor":"Егор","amount_rubles":250}`}}},
+	}
+	got, err := agent.Handle(ctx, 42, "закрой долг Егора 250")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got != "Долг закрыт: Егор — 250 ₽." {
+		t.Errorf("answer = %q", got)
+	}
+	if d, _ := debts.Peek("debt-2"); d.SettledAt == nil {
+		t.Error("the 250 debt must be settled")
+	}
+	if d, _ := debts.Peek("debt-1"); d.SettledAt != nil {
+		t.Error("the 200 debt must stay open")
 	}
 }
 
@@ -226,31 +283,42 @@ func TestAgentGetBudgetsStatus(t *testing.T) {
 
 	llm.Queue = []port.ChatResponse{
 		{ToolCalls: []port.ToolCall{{ID: "c1", Name: "get_budgets", ArgsJSON: `{}`}}},
-		{Content: "Лимиты и траты"},
 	}
 
-	if _, err := agent.Handle(ctx, 42, "мои лимиты"); err != nil {
+	got, err := agent.Handle(ctx, 42, "мои лимиты")
+	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	toolMsg := lastToolMessage(t, llm.Requests[1])
-	var payload struct {
-		Items []struct {
-			Category       string  `json:"category"`
-			MonthlyLimit   float64 `json:"monthly_limit_rubles"`
-			SpentThisMonth float64 `json:"spent_this_month_rubles"`
-			Remaining      float64 `json:"remaining_rubles"`
-			Exceeded       bool    `json:"exceeded"`
-		} `json:"items"`
+	// Budgets are rendered locally: another member's spending must not
+	// leak, and the status line carries no English or ids.
+	want := "Лимиты на месяц:\nЕда — 1 000 ₽: потрачено 300 ₽, осталось 700 ₽"
+	if got != want {
+		t.Fatalf("answer = %q, want %q", got, want)
 	}
-	if err := json.Unmarshal([]byte(toolMsg.Content), &payload); err != nil {
-		t.Fatalf("tool result: %v (%q)", err, toolMsg.Content)
+	if len(llm.Requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (local render)", len(llm.Requests))
 	}
-	if len(payload.Items) != 1 {
-		t.Fatalf("items = %d, want 1", len(payload.Items))
+}
+
+func TestAgentGetBudgetsExceeded(t *testing.T) {
+	agent, llm, expenses, _, budgets := newFullAgent(t)
+	seedBudget(t, budgets, 42, domain.CategoryFood, 100000)
+	seedExpense(t, expenses, "exp-1", 42, 150000, domain.CategoryFood, "2026-10-18")
+
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{ID: "c1", Name: "get_budgets", ArgsJSON: `{}`}}},
 	}
-	st := payload.Items[0]
-	if st.MonthlyLimit != 1000 || st.SpentThisMonth != 300 || st.Remaining != 700 || st.Exceeded {
-		t.Fatalf("status = %+v", st)
+
+	got, err := agent.Handle(ctx, 42, "мои лимиты")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	want := "Лимиты на месяц:\nЕда — 1 000 ₽: потрачено 1 500 ₽, лимит превышен"
+	if got != want {
+		t.Fatalf("answer = %q, want %q", got, want)
+	}
+	if len(llm.Requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (local render)", len(llm.Requests))
 	}
 }
 
@@ -262,31 +330,22 @@ func TestAgentAddExpenseCarriesBudgetWarning(t *testing.T) {
 		{ToolCalls: []port.ToolCall{{
 			ID:       "c1",
 			Name:     "add_expense",
-			ArgsJSON: `{"amount_rubles":800,"category":"food"}`,
+			ArgsJSON: `{"amount_rubles":800,"category":"food","spent_at":"2026-10-18"}`,
 		}}},
-		{Content: "Записала, но лимит почти исчерпан"},
 	}
 
-	if _, err := agent.Handle(ctx, 42, "обед 800"); err != nil {
+	got, err := agent.Handle(ctx, 42, "обед 800")
+	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	toolMsg := lastToolMessage(t, llm.Requests[1])
-	var payload struct {
-		Budget *struct {
-			MonthlyLimit   float64 `json:"monthly_limit_rubles"`
-			SpentThisMonth float64 `json:"spent_this_month_rubles"`
-			Remaining      float64 `json:"remaining_rubles"`
-			Exceeded       bool    `json:"exceeded"`
-		} `json:"budget"`
+	// The budget status is attached to the add payload and surfaces in
+	// the local confirmation — no second round needed to warn the user.
+	want := "Записал: Еда — 800 ₽, 18.10.2026. ⚠️ На Еду до конца месяца осталось 200 ₽ из 1 000 ₽."
+	if got != want {
+		t.Fatalf("answer = %q, want %q", got, want)
 	}
-	if err := json.Unmarshal([]byte(toolMsg.Content), &payload); err != nil {
-		t.Fatalf("tool result: %v (%q)", err, toolMsg.Content)
-	}
-	if payload.Budget == nil {
-		t.Fatal("budget block missing from add_expense payload")
-	}
-	if payload.Budget.SpentThisMonth != 800 || payload.Budget.Remaining != 200 || payload.Budget.Exceeded {
-		t.Fatalf("budget = %+v", payload.Budget)
+	if len(llm.Requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(llm.Requests))
 	}
 }
 
@@ -296,17 +355,17 @@ func TestAgentAddExpenseNoBudgetBlockWhenUnset(t *testing.T) {
 		{ToolCalls: []port.ToolCall{{
 			ID:       "c1",
 			Name:     "add_expense",
-			ArgsJSON: `{"amount_rubles":800,"category":"food"}`,
+			ArgsJSON: `{"amount_rubles":800,"category":"food","spent_at":"2026-10-18"}`,
 		}}},
-		{Content: "Записала"},
 	}
 
-	if _, err := agent.Handle(ctx, 42, "обед 800"); err != nil {
+	got, err := agent.Handle(ctx, 42, "обед 800")
+	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	toolMsg := lastToolMessage(t, llm.Requests[1])
-	if strings.Contains(toolMsg.Content, `"budget"`) {
-		t.Errorf("no budget block expected without a budget, got %q", toolMsg.Content)
+	want := "Записал: Еда — 800 ₽, 18.10.2026."
+	if got != want {
+		t.Fatalf("answer = %q, want %q", got, want)
 	}
 }
 

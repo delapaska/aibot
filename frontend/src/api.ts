@@ -1,7 +1,7 @@
 // Thin fetch wrapper over the panel REST API. Errors are surfaced as
 // Russian messages ready to show in the UI.
 
-import type { Expense, ExpenseInput, ExpensesPage, User } from './types'
+import type { Debt, DebtInput, DebtsPage, Expense, ExpenseInput, ExpensesPage, User } from './types'
 
 export class ApiError extends Error {
   status: number
@@ -56,4 +56,15 @@ export const api = {
     request<Expense>('PATCH', `/api/v1/expenses/${id}`, patch),
 
   deleteExpense: (id: string) => request<void>('DELETE', `/api/v1/expenses/${id}`),
+
+  listDebts: (params: { user_id?: number; open?: boolean }) => {
+    const q = new URLSearchParams()
+    if (params.user_id) q.set('user_id', String(params.user_id))
+    if (params.open !== undefined) q.set('open', String(params.open))
+    return request<DebtsPage>('GET', `/api/v1/debts?${q.toString()}`)
+  },
+
+  createDebt: (input: DebtInput) => request<Debt>('POST', '/api/v1/debts', input),
+
+  settleDebt: (id: string) => request<Debt>('POST', `/api/v1/debts/${id}/settle`),
 }

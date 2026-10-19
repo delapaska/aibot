@@ -128,6 +128,18 @@ input[type='date'] {
   padding: 6px 16px 14px;
 }
 
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.section-head h2 {
+  margin: 10px 0;
+  font-size: 16px;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -187,6 +199,10 @@ td.comment {
 .chip-health { background: #e2f2f0; color: #2c7a6d; }
 .chip-shopping { background: #ece4f7; color: #64409c; }
 .chip-other { background: #eceef1; color: #5a6572; }
+
+/* debt direction chips */
+.chip-owes_me { background: #e0f2e6; color: #1f7a44; }
+.chip-i_owe { background: #fbe9e7; color: #a5433a; }
 
 .muted {
   color: var(--muted);

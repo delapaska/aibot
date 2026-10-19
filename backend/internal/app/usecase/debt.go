@@ -54,12 +54,23 @@ func (s *DebtService) List(ctx context.Context, f port.DebtFilter) ([]domain.Deb
 // Settle marks the debt repaid. Scoping matches the expense service: a
 // foreign id is ErrNotFound, a second settle is ErrAlreadySettled.
 func (s *DebtService) Settle(ctx context.Context, userID int64, id string, settledAt time.Time) (domain.Debt, error) {
-	d, err := s.debts.Get(ctx, &userID, id)
+	return s.settle(ctx, &userID, id, settledAt)
+}
+
+// SettleAny settles a debt without user scoping: the panel's
+// head-of-family view may close anyone's debt. The time comes from the
+// service clock.
+func (s *DebtService) SettleAny(ctx context.Context, id string) (domain.Debt, error) {
+	return s.settle(ctx, nil, id, s.clock.Now())
+}
+
+func (s *DebtService) settle(ctx context.Context, userID *int64, id string, settledAt time.Time) (domain.Debt, error) {
+	d, err := s.debts.Get(ctx, userID, id)
 	if err != nil {
 		return domain.Debt{}, err
 	}
 	if d.SettledAt != nil {
 		return domain.Debt{}, domain.ErrAlreadySettled
 	}
-	return s.debts.Settle(ctx, &userID, id, settledAt)
+	return s.debts.Settle(ctx, userID, id, settledAt)
 }

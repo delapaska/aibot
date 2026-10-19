@@ -46,13 +46,12 @@ func tgUpdate(id, fromID int64, chatType, text string) port.TelegramUpdate {
 func TestBotAnswersPrivateMessage(t *testing.T) {
 	bot, users, expenses, llm, _ := newBot(t, nil)
 	llm.Queue = []port.ChatResponse{
-		{ToolCalls: []port.ToolCall{{ID: "t1", Name: "add_expense", ArgsJSON: `{"amount_rubles":350,"category":"food"}`}}},
-		{Content: "Записал: еда 350 ₽"},
+		{ToolCalls: []port.ToolCall{{ID: "t1", Name: "add_expense", ArgsJSON: `{"amount_rubles":350,"category":"food","spent_at":"2026-10-18"}`}}},
 	}
 
 	replies := bot.HandleUpdate(ctx, tgUpdate(1, 42, "private", "кофе 350"))
 
-	if len(replies) != 1 || replies[0] != "Записал: еда 350 ₽" {
+	if len(replies) != 1 || replies[0] != "Записал: Еда — 350 ₽, 18.10.2026." {
 		t.Fatalf("replies = %v", replies)
 	}
 	if users.Len() != 1 {

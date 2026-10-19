@@ -131,5 +131,28 @@ func TestDebtServiceSettleForeignIsNotFound(t *testing.T) {
 	}
 }
 
+func TestDebtServiceSettleAny(t *testing.T) {
+	svc, _, _, _ := newDebtService(t)
+	if _, err := svc.Create(ctx, DebtInput{UserID: 42, Direction: domain.DebtOwesMe, Debtor: "Егор", Amount: 500}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The panel path settles without scoping: no user id is passed.
+	d, err := svc.SettleAny(ctx, "debt-1")
+	if err != nil {
+		t.Fatalf("SettleAny() unexpected error: %v", err)
+	}
+	if d.SettledAt == nil || !d.SettledAt.Equal(now) {
+		t.Fatalf("SettledAt = %v, want %v", d.SettledAt, now)
+	}
+
+	if _, err := svc.SettleAny(ctx, "debt-1"); !errors.Is(err, domain.ErrAlreadySettled) {
+		t.Fatalf("double settle error = %v, want ErrAlreadySettled", err)
+	}
+	if _, err := svc.SettleAny(ctx, "missing"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("missing settle error = %v, want ErrNotFound", err)
+	}
+}
+
 // int64p is a small helper for filter pointers in tests.
 func int64p(v int64) *int64 { return &v }

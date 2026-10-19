@@ -74,6 +74,11 @@ func TestAgentPlainAnswer(t *testing.T) {
 	if !strings.Contains(sys.Content, "перечисли траты из ответа") {
 		t.Errorf("system prompt must require listing expenses from the tool answer, got %q", sys.Content)
 	}
+	// Record ids are for the agent's own tool chains only: they must never
+	// reach the user, who sees them as noise.
+	if !strings.Contains(sys.Content, "id не показывай") {
+		t.Errorf("system prompt must forbid showing record ids, got %q", sys.Content)
+	}
 	if req.Messages[1].Content != "привет" || req.Messages[1].Role != port.RoleUser {
 		t.Errorf("user message = %+v", req.Messages[1])
 	}
@@ -90,15 +95,20 @@ func TestAgentAddExpenseFlow(t *testing.T) {
 			Name:     "add_expense",
 			ArgsJSON: `{"amount_rubles":350.13,"category":"food","spent_at":"2026-10-17","comment":"кофе"}`,
 		}}},
-		{Content: "Записал: кофе — 350,13 ₽"},
 	}
 
 	got, err := agent.Handle(ctx, 42, "кофе 350.13 17 октября")
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	if got != "Записал: кофе — 350,13 ₽" {
-		t.Errorf("answer = %q", got)
+	// A plain write is confirmed locally: no second LLM round is spent
+	// just to say "записал" — that round doubled the wait on slow models.
+	want := "Записал: кофе (Еда) — 350,13 ₽, 17.10.2026."
+	if got != want {
+		t.Errorf("answer = %q, want %q", got, want)
+	}
+	if len(llm.Requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (no second round for a write)", len(llm.Requests))
 	}
 	if expenses.Len() != 1 {
 		t.Fatalf("stored %d expenses, want 1", expenses.Len())
@@ -110,18 +120,230 @@ func TestAgentAddExpenseFlow(t *testing.T) {
 	if stored.Comment != "кофе" {
 		t.Errorf("comment = %q", stored.Comment)
 	}
+}
 
-	// The second LLM round carries the assistant's tool calls and the
-	// tool result with the created expense.
-	req := llm.Requests[1]
-	var sawToolResult bool
-	for _, m := range req.Messages {
-		if m.Role == port.RoleTool && strings.Contains(m.Content, `"id":"exp-1"`) {
-			sawToolResult = true
+func TestAgentAddWithoutComment(t *testing.T) {
+	agent, llm, _ := newAgent(t)
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{
+			ID:       "c1",
+			Name:     "add_expense",
+			ArgsJSON: `{"amount_rubles":200,"category":"food","spent_at":"2026-10-18"}`,
+		}}},
+	}
+
+	got, err := agent.Handle(ctx, 42, "пельмени 200")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	want := "Записал: Еда — 200 ₽, 18.10.2026."
+	if got != want {
+		t.Errorf("answer = %q, want %q", got, want)
+	}
+}
+
+// newAgentWithBudget builds an agent whose user 42 has a monthly limit
+// set (0 removes the budget); returns the debts fake too for seeding.
+func newAgentWithBudget(t *testing.T, cat domain.Category, limitRubles float64) (*Agent, *fakes.LLM, *fakes.Expenses, *fakes.Debts) {
+	t.Helper()
+	expenses := fakes.NewExpenses()
+	users := fakes.NewUsers()
+	clock := fakes.Clock{T: now}
+	svc := NewExpenseService(expenses, users, clock)
+	budgets := NewBudgetService(fakes.NewBudgets(), svc, clock)
+	if limitRubles > 0 {
+		if _, err := budgets.Set(ctx, BudgetInput{
+			UserID:       42,
+			Category:     cat,
+			MonthlyLimit: mustKop(t, limitRubles),
+		}); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if !sawToolResult {
-		t.Error("tool result with the created expense id must reach the model")
+	debts := fakes.NewDebts()
+	llm := &fakes.LLM{}
+	agent := NewAgent(llm, svc, NewDebtService(debts, users, clock), budgets, clock)
+	return agent, llm, expenses, debts
+}
+
+func TestAgentAddBudgetExceededWarning(t *testing.T) {
+	agent, llm, expenses, _ := newAgentWithBudget(t, domain.CategoryFood, 1000)
+	seedExpense(t, expenses, "exp-9", 42, mustKop(t, 900), domain.CategoryFood, "2026-10-05")
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{
+			ID:       "c1",
+			Name:     "add_expense",
+			ArgsJSON: `{"amount_rubles":200,"category":"food","spent_at":"2026-10-18"}`,
+		}}},
+	}
+
+	got, err := agent.Handle(ctx, 42, "пельмени 200")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	want := "Записал: Еда — 200 ₽, 18.10.2026. ⚠️ Месячный лимит на Еду превышен: потрачено 1 100 ₽ из 1 000 ₽."
+	if got != want {
+		t.Errorf("answer = %q, want %q", got, want)
+	}
+}
+
+func TestAgentAddBudgetLowWarning(t *testing.T) {
+	agent, llm, expenses, _ := newAgentWithBudget(t, domain.CategoryFood, 1000)
+	seedExpense(t, expenses, "exp-9", 42, mustKop(t, 750), domain.CategoryFood, "2026-10-05")
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{
+			ID:       "c1",
+			Name:     "add_expense",
+			ArgsJSON: `{"amount_rubles":200,"category":"food","spent_at":"2026-10-18"}`,
+		}}},
+	}
+
+	got, err := agent.Handle(ctx, 42, "пельмени 200")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	want := "Записал: Еда — 200 ₽, 18.10.2026. ⚠️ На Еду до конца месяца осталось 50 ₽ из 1 000 ₽."
+	if got != want {
+		t.Errorf("answer = %q, want %q", got, want)
+	}
+}
+
+func TestAgentUpdateRepliesLocally(t *testing.T) {
+	agent, llm, expenses := newAgent(t)
+	seedExpense(t, expenses, "exp-1", 42, mustKop(t, 350), domain.CategoryFood, "2026-10-17")
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{
+			ID:       "c1",
+			Name:     "update_expense",
+			ArgsJSON: `{"expense_id":"exp-1","amount_rubles":250}`,
+		}}},
+	}
+
+	got, err := agent.Handle(ctx, 42, "исправь кофе на 250")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	want := "Изменил: комментарий (Еда) — 250 ₽, 17.10.2026."
+	if got != want {
+		t.Errorf("answer = %q, want %q", got, want)
+	}
+	if len(llm.Requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(llm.Requests))
+	}
+}
+
+func TestAgentDeleteRepliesLocally(t *testing.T) {
+	agent, llm, expenses := newAgent(t)
+	seedExpense(t, expenses, "exp-1", 42, mustKop(t, 350), domain.CategoryFood, "2026-10-17")
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{
+			ID:       "c1",
+			Name:     "delete_expense",
+			ArgsJSON: `{"expense_id":"exp-1"}`,
+		}}},
+	}
+
+	got, err := agent.Handle(ctx, 42, "удали кофе")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got != "Удалил расход." {
+		t.Errorf("answer = %q", got)
+	}
+	if expenses.Len() != 0 {
+		t.Errorf("expense was not deleted")
+	}
+}
+
+func TestAgentDebtRepliesLocally(t *testing.T) {
+	agent, llm, _, _ := newAgentWithBudget(t, domain.CategoryFood, 0)
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{
+			ID:       "c1",
+			Name:     "add_debt",
+			ArgsJSON: `{"debtor":"Егор","amount_rubles":500,"direction":"owes_me"}`,
+		}}},
+	}
+
+	got, err := agent.Handle(ctx, 42, "Егор взял у меня 500")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	want := "Записал долг: Егор → тебе, 500 ₽."
+	if got != want {
+		t.Errorf("answer = %q, want %q", got, want)
+	}
+
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{
+			ID:       "c2",
+			Name:     "add_debt",
+			ArgsJSON: `{"debtor":"Егор","amount_rubles":300,"direction":"i_owe"}`,
+		}}},
+	}
+	got, err = agent.Handle(ctx, 42, "я должен Егору 300")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	want = "Записал долг: ты → Егор, 300 ₽."
+	if got != want {
+		t.Errorf("answer = %q, want %q", got, want)
+	}
+}
+
+func TestAgentRepayRepliesLocally(t *testing.T) {
+	agent, llm, _, debts := newAgentWithBudget(t, domain.CategoryFood, 0)
+	users := fakes.NewUsers()
+	svc := NewDebtService(debts, users, fakes.Clock{T: now})
+	if _, err := svc.Create(ctx, DebtInput{
+		UserID: 42, Direction: domain.DebtOwesMe, Debtor: "Егор", Amount: mustKop(t, 500),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{{
+			ID:       "c1",
+			Name:     "repay_debt",
+			ArgsJSON: `{"debtor":"Егор"}`,
+		}}},
+	}
+
+	got, err := agent.Handle(ctx, 42, "Егор вернул долг")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	want := "Долг закрыт: Егор — 500 ₽."
+	if got != want {
+		t.Errorf("answer = %q, want %q", got, want)
+	}
+}
+
+func TestAgentMixedRoundUsesModel(t *testing.T) {
+	// A round that mixes a write with list_expenses still needs the
+	// model: the expense list is presented by the model, so no local
+	// shortcut (unlike list_debts/get_summary/get_budgets, which render
+	// locally).
+	agent, llm, expenses := newAgent(t)
+	llm.Queue = []port.ChatResponse{
+		{ToolCalls: []port.ToolCall{
+			{ID: "c1", Name: "add_expense", ArgsJSON: `{"amount_rubles":200,"category":"food","spent_at":"2026-10-18"}`},
+			{ID: "c2", Name: "list_expenses", ArgsJSON: `{}`},
+		}},
+		{Content: "Записал. Вот список: ..."},
+	}
+
+	got, err := agent.Handle(ctx, 42, "запиши пельмени 200 и покажи расходы")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got != "Записал. Вот список: ..." {
+		t.Errorf("answer = %q", got)
+	}
+	if len(llm.Requests) != 2 {
+		t.Fatalf("requests = %d, want 2 (mixed round goes back to the model)", len(llm.Requests))
+	}
+	if expenses.Len() != 1 {
+		t.Fatalf("stored %d expenses, want 1", expenses.Len())
 	}
 }
 
@@ -292,26 +514,23 @@ func TestAgentSummary(t *testing.T) {
 
 	llm.Queue = []port.ChatResponse{
 		{ToolCalls: []port.ToolCall{{ID: "c1", Name: "get_summary", ArgsJSON: `{"from":"2026-10-01","to":"2026-10-31"}`}}},
-		{Content: "Итого за октябрь"},
 	}
 
-	if _, err := agent.Handle(ctx, 42, "итоги за месяц"); err != nil {
+	got, err := agent.Handle(ctx, 42, "итоги за месяц")
+	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	toolMsg := lastToolMessage(t, llm.Requests[1])
-	var payload struct {
-		TotalRubles float64            `json:"total_rubles"`
-		Count       int                `json:"count"`
-		ByCategory  map[string]float64 `json:"by_category"`
+	// The summary is rendered locally: English category keys never
+	// surface and the model cannot add up amounts wrongly.
+	want := "Расходы по категориям:\n" +
+		"Еда — 820 ₽\n" +
+		"Транспорт — 120 ₽\n" +
+		"Итого: 940 ₽ за 3 операции."
+	if got != want {
+		t.Fatalf("answer = %q, want %q", got, want)
 	}
-	if err := json.Unmarshal([]byte(toolMsg.Content), &payload); err != nil {
-		t.Fatalf("tool result: %v (%q)", err, toolMsg.Content)
-	}
-	if payload.TotalRubles != 940 || payload.Count != 3 {
-		t.Errorf("total = %v, count = %d, want 940/3", payload.TotalRubles, payload.Count)
-	}
-	if payload.ByCategory["food"] != 820 || payload.ByCategory["transport"] != 120 {
-		t.Errorf("by_category = %v", payload.ByCategory)
+	if len(llm.Requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (local render)", len(llm.Requests))
 	}
 }
 
@@ -335,6 +554,14 @@ func TestAgentLLMError(t *testing.T) {
 
 	if _, err := agent.Handle(ctx, 42, "привет"); err == nil || !strings.Contains(err.Error(), "provider down") {
 		t.Fatalf("error = %v, want provider error", err)
+	}
+}
+
+func TestStripIDNoise(t *testing.T) {
+	in := "Егор — 500 ₽ (id 01a1505f-2b3c-4d5e-8f90-112233445566), кофе 200 ₽"
+	want := "Егор — 500 ₽ (), кофе 200 ₽"
+	if got := stripIDNoise(in); got != want {
+		t.Errorf("stripIDNoise = %q, want %q", got, want)
 	}
 }
 

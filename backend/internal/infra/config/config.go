@@ -39,6 +39,10 @@ type Config struct {
 	// are resolved against it.
 	Location *time.Location
 
+	// LLMFallbackModels lists alternate models tried in order when the
+	// primary one is rate-limited or unavailable (OpenRouter "models").
+	LLMFallbackModels []string
+
 	LogLevel string // debug|info|warn|error
 }
 
@@ -60,6 +64,13 @@ func Load() (Config, error) {
 		LLMModel:      env("LLM_MODEL", "gpt-4o-mini"),
 		PanelToken:    env("PANEL_TOKEN", ""),
 		LogLevel:      env("LOG_LEVEL", "info"),
+	}
+
+	// Comma-separated alternates for the primary model; empty is fine.
+	for _, m := range strings.Split(env("LLM_FALLBACK_MODELS", ""), ",") {
+		if m = strings.TrimSpace(m); m != "" {
+			cfg.LLMFallbackModels = append(cfg.LLMFallbackModels, m)
+		}
 	}
 
 	cfg.PostgresDSN = dsnFromEnv()

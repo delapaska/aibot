@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,6 +67,62 @@ func TestChatCompleteBasic(t *testing.T) {
 	}
 	if _, has := gotBody["tools"]; has {
 		t.Error("tools must be omitted when empty")
+	}
+}
+
+// TestFallbackModelsSentInRequest: fallback models travel in the OpenRouter
+// "models" field so a rate-limited primary is rerouted server-side.
+func TestFallbackModelsSentInRequest(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "key", "primary", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.wait = func(int) time.Duration { return 0 }
+	c.WithFallbacks([]string{"fallback-a", "fallback-b"})
+	_, err := c.ChatComplete(context.Background(), port.ChatRequest{
+		Messages: []port.ChatMessage{{Role: port.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatComplete: %v", err)
+	}
+	if gotBody["model"] != "primary" {
+		t.Errorf("model = %v, want primary", gotBody["model"])
+	}
+	got, _ := gotBody["models"].([]any)
+	want := []any{"primary", "fallback-a", "fallback-b"}
+	if len(got) != len(want) {
+		t.Fatalf("models = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("models = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestNoFallbackFieldWithoutFallbacks(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL, "key")
+	_, err := c.ChatComplete(context.Background(), port.ChatRequest{
+		Messages: []port.ChatMessage{{Role: port.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatComplete: %v", err)
+	}
+	if _, has := gotBody["models"]; has {
+		t.Error("models must be omitted when no fallbacks configured")
 	}
 }
 
@@ -275,6 +333,96 @@ func TestContextCancel(t *testing.T) {
 	defer cancel()
 	if _, err := c.ChatComplete(ctx, port.ChatRequest{}); err == nil {
 		t.Fatal("want an error on a cancelled context")
+	}
+}
+
+func TestRetryOnEmptyResponse(t *testing.T) {
+	// Free models sometimes answer with a blank message; a silent bot is
+	// the worst outcome, so the client must treat it as transient.
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		if hits == 1 {
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":""}}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Записал: кофе 350"}}]}`)
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL, "k")
+	resp, err := c.ChatComplete(context.Background(), port.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatComplete: %v", err)
+	}
+	if resp.Content != "Записал: кофе 350" || hits != 2 {
+		t.Errorf("content = %q, hits = %d, want retry on empty then success", resp.Content, hits)
+	}
+}
+
+func TestNoRetryWhenBudgetNearlyGone(t *testing.T) {
+	// Near the parent deadline a retry cannot finish: it would only burn
+	// the remaining seconds and die on the deadline anyway.
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL, "k")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := c.ChatComplete(ctx, port.ChatRequest{}); err == nil {
+		t.Fatal("want an error")
+	}
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1 (no doomed retries near the deadline)", hits)
+	}
+}
+
+func TestLargeResponseDecodedFully(t *testing.T) {
+	// Provider responses with tool calls and long text exceed the old
+	// 4 KiB read cap; a truncated body decoded as "unexpected end of
+	// JSON input". The full body must reach the decoder.
+	content := strings.Repeat("хранение ", 3000) // ~27 KB
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":`+strconv.Quote(content)+`}}]}`)
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL, "k")
+	resp, err := c.ChatComplete(context.Background(), port.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatComplete: %v", err)
+	}
+	if resp.Content != content {
+		t.Errorf("content truncated: got %d bytes, want %d", len(resp.Content), len(content))
+	}
+}
+
+func TestRetryOnTruncatedJSON(t *testing.T) {
+	// A body cut off mid-JSON (flaky network, provider hiccup) is
+	// transient: the same request succeeds on the next attempt.
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		if hits == 1 {
+			_, _ = io.WriteString(w, `{"choices":[{"mess`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ок"}}]}`)
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL, "k")
+	resp, err := c.ChatComplete(context.Background(), port.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatComplete: %v", err)
+	}
+	if resp.Content != "ок" || hits != 2 {
+		t.Errorf("content = %q, hits = %d, want retry on truncated JSON", resp.Content, hits)
 	}
 }
 

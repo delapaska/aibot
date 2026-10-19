@@ -8,7 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,15 +59,31 @@ func (a *Agent) Handle(ctx context.Context, userID int64, userMsg string) (strin
 			return "", fmt.Errorf("agent: %w", err)
 		}
 		if len(resp.ToolCalls) == 0 {
-			return resp.Content, nil
+			return stripIDNoise(resp.Content), nil
 		}
 		msgs = append(msgs, port.ChatMessage{Role: port.RoleAssistant, ToolCalls: resp.ToolCalls})
-		for _, call := range resp.ToolCalls {
+
+		payloads := make([]any, len(resp.ToolCalls))
+		for i, call := range resp.ToolCalls {
+			payloads[i] = a.execTool(ctx, userID, call)
+			b, err := json.Marshal(payloads[i])
+			if err != nil {
+				b = []byte(`{"error":"не удалось сформировать ответ инструмента"}`)
+			}
 			msgs = append(msgs, port.ChatMessage{
 				Role:       port.RoleTool,
 				ToolCallID: call.ID,
-				Content:    a.runTool(ctx, userID, call),
+				Content:    string(b),
 			})
+		}
+		// Replies the model adds no wording to are rendered locally:
+		// successful writes and terminal reads (debt list, summary,
+		// budgets). This keeps ids and English labels out of the user's
+		// chat and saves a second LLM round. Reads that feed follow-up
+		// tool chains (list_expenses), errors and mixed rounds still go
+		// back to the model.
+		if reply, ok := localReply(resp.ToolCalls, payloads); ok {
+			return stripIDNoise(reply), nil
 		}
 	}
 	return "", ErrAgentLimit
@@ -134,10 +153,11 @@ var agentTools = []port.Tool{
 	},
 	{
 		Name:        "repay_debt",
-		Description: "Отметить долг возвращённым; id берётся из list_debts",
+		Description: "Отметить долг возвращённым по имени человека",
 		ParamsJSON: `{"type":"object","properties":{` +
-			`"debt_id":{"type":"string"}},` +
-			`"required":["debt_id"]}`,
+			`"debtor":{"type":"string","description":"имя человека из list_debts"},` +
+			`"amount_rubles":{"type":"number","description":"сумма, если у человека несколько открытых долгов"}},` +
+			`"required":["debtor"]}`,
 	},
 	{
 		Name:        "set_budget",
@@ -180,11 +200,14 @@ const promptTemplate = `Ты — финансовый помощник семь�
 - В ответе list_expenses: total_count — сколько всего найдено операций, sum_rubles — их сумма в рублях. ` +
 	`Суммы и числа бери только из ответов инструментов, не считай и не придумывай сам.
 - Долги: owes_me — «мне должны» (Егор взял у меня в долг), i_owe — «я должен». ` +
-	`В ответе list_debts: total_owes_me_rubles и total_i_owe_rubles — готовые суммы открытых долгов.
+	`Чтобы закрыть долг, вызови repay_debt, указав имя человека (debtor); если у него несколько ` +
+	`открытых долгов, инструмент сам попросит сумму.
+- id записей из ответов инструментов нужны только тебе — для следующих вызовов инструментов. ` +
+	`Пользователю id не показывай: для него это шум.
 - Если в ответе add_expense есть блок budget: remaining_rubles — сколько осталось до лимита за месяц. ` +
 	`Если exceeded true — предупреди, что месячный лимит превышен; если осталось меньше 20%% лимита — мягко напомни.
 - Не выдумывай данные: если инструмент вернул ошибку, сообщи о ней пользователю своими словами.
-- Отвечай кратко и по-русски.`
+- Отвечай кратко, только по-русски: без английских слов и без id (длинных кодов из букв и цифр).`
 
 func (a *Agent) systemPrompt() string {
 	t := a.clock.Now()
@@ -203,16 +226,320 @@ var weekdaysRu = map[time.Weekday]string{
 
 func russianWeekday(w time.Weekday) string { return weekdaysRu[w] }
 
-// runTool executes one tool call and returns the JSON payload for the
-// model. Errors are carried inside the payload: the model should see
-// them and explain the problem to the user.
-func (a *Agent) runTool(ctx context.Context, userID int64, call port.ToolCall) string {
-	payload := a.execTool(ctx, userID, call)
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return `{"error":"не удалось сформировать ответ инструмента"}`
+// localReply builds the user-facing reply locally when the model adds no
+// wording: successful writes and terminal reads (debt list, summary,
+// budgets) whose answers are fully precomputed server-side. Returns
+// ok=false when the round still needs the model: list_expenses (its ids
+// feed update/delete chains), errors, unknown tools.
+func localReply(calls []port.ToolCall, payloads []any) (string, bool) {
+	lines := make([]string, len(calls))
+	for i, call := range calls {
+		p, ok := payloadMap(payloads[i])
+		if !ok {
+			return "", false
+		}
+		switch call.Name {
+		case "add_expense", "update_expense":
+			verb := "Записал"
+			if call.Name == "update_expense" {
+				verb = "Изменил"
+			}
+			lines[i] = expenseLine(verb, p)
+		case "delete_expense":
+			if _, ok := p["ok"]; !ok {
+				return "", false
+			}
+			lines[i] = "Удалил расход."
+		case "add_debt":
+			lines[i] = debtLine(p)
+		case "repay_debt":
+			lines[i] = repayLine(p)
+		case "list_debts":
+			lines[i] = debtListLine(p)
+		case "get_summary":
+			lines[i] = summaryLine(p)
+		case "get_budgets":
+			lines[i] = budgetListLine(p)
+		default:
+			return "", false
+		}
 	}
-	return string(b)
+	return strings.Join(lines, "\n"), true
+}
+
+// payloadMap casts a tool payload and rejects error payloads: an error
+// must reach the model, which explains it to the user in its own words.
+func payloadMap(payload any) (map[string]any, bool) {
+	p, ok := payload.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	if _, bad := p["error"]; bad {
+		return nil, false
+	}
+	return p, true
+}
+
+// expenseLine renders one confirmation: «Записал: кофе (Еда) — 350,13 ₽,
+// 17.10.2026. [budget warning]».
+func expenseLine(verb string, p map[string]any) string {
+	cat, _ := p["category"].(string)
+	amount, _ := p["amount_rubles"].(float64)
+	date, _ := p["spent_at"].(string)
+	comment, _ := p["comment"].(string)
+
+	var b strings.Builder
+	b.WriteString(verb + ": ")
+	if comment != "" {
+		b.WriteString(comment + " (" + domain.Category(cat).Title() + ") — ")
+	} else {
+		b.WriteString(domain.Category(cat).Title() + " — ")
+	}
+	b.WriteString(formatRubles(amount) + " ₽, " + formatRuDate(date) + ".")
+	if bp, ok := p["budget"].(map[string]any); ok {
+		if w := budgetWarning(bp); w != "" {
+			b.WriteString(" " + w)
+		}
+	}
+	return b.String()
+}
+
+// budgetWarning mirrors the prompt rule: warn when the monthly limit is
+// exceeded or at most 20% of it remains.
+func budgetWarning(bp map[string]any) string {
+	cat, _ := bp["category"].(string)
+	limit, _ := bp["monthly_limit_rubles"].(float64)
+	remaining, _ := bp["remaining_rubles"].(float64)
+	spent, _ := bp["spent_this_month_rubles"].(float64)
+	exceeded, _ := bp["exceeded"].(bool)
+	if exceeded {
+		return fmt.Sprintf("⚠️ Месячный лимит на %s превышен: потрачено %s ₽ из %s ₽.",
+			categoryOn(domain.Category(cat)), formatRubles(spent), formatRubles(limit))
+	}
+	if limit > 0 && remaining*5 <= limit {
+		return fmt.Sprintf("⚠️ На %s до конца месяца осталось %s ₽ из %s ₽.",
+			categoryOn(domain.Category(cat)), formatRubles(remaining), formatRubles(limit))
+	}
+	return ""
+}
+
+// categoryOn renders a category for the preposition «на» (На Еду,
+// На Транспорт), keeping the Title-case label style used in the same
+// confirmation: a lowercase «на еду» would clash with «Еда» above it.
+var categoryOnMap = map[domain.Category]string{
+	domain.CategoryFood:          "Еду",
+	domain.CategoryTransport:     "Транспорт",
+	domain.CategoryHousing:       "Жильё",
+	domain.CategoryEntertainment: "Развлечения",
+	domain.CategoryHealth:        "Здоровье",
+	domain.CategoryShopping:      "Покупки",
+	domain.CategoryOther:         "Другое",
+}
+
+func categoryOn(c domain.Category) string {
+	if s, ok := categoryOnMap[c]; ok {
+		return s
+	}
+	return c.Title()
+}
+
+// debtLine renders a debt confirmation with the debtor in the nominative
+// (Russian names do not inflect reliably): «Записал долг: Егор → тебе,
+// 500 ₽.» / «Записал долг: ты → Егор, 300 ₽.»
+func debtLine(p map[string]any) string {
+	debtor, _ := p["debtor"].(string)
+	amount, _ := p["amount_rubles"].(float64)
+	dir, _ := p["direction"].(string)
+	comment, _ := p["comment"].(string)
+
+	var b strings.Builder
+	b.WriteString("Записал долг: ")
+	if domain.DebtDirection(dir) == domain.DebtIOwe {
+		fmt.Fprintf(&b, "ты → %s, %s ₽", debtor, formatRubles(amount))
+	} else {
+		fmt.Fprintf(&b, "%s → тебе, %s ₽", debtor, formatRubles(amount))
+	}
+	if comment != "" {
+		b.WriteString(" (комментарий: " + comment + ")")
+	}
+	b.WriteString(".")
+	return b.String()
+}
+
+func repayLine(p map[string]any) string {
+	debtor, _ := p["debtor"].(string)
+	amount, _ := p["amount_rubles"].(float64)
+	return fmt.Sprintf("Долг закрыт: %s — %s ₽.", debtor, formatRubles(amount))
+}
+
+// debtListLine renders the open-debt list in Russian: sections «Мне
+// должны» and «Я должен» with numbered entries and precomputed totals.
+// English direction labels and record ids never reach the user.
+func debtListLine(p map[string]any) string {
+	items, _ := p["items"].([]map[string]any)
+	owesMe, _ := p["total_owes_me_rubles"].(float64)
+	iOwe, _ := p["total_i_owe_rubles"].(float64)
+	if len(items) == 0 {
+		return "Открытых долгов нет."
+	}
+	var mine, theirs []string
+	for _, it := range items {
+		debtor, _ := it["debtor"].(string)
+		amount, _ := it["amount_rubles"].(float64)
+		line := debtor + " — " + formatRubles(amount) + " ₽"
+		if dir, _ := it["direction"].(string); domain.DebtDirection(dir) == domain.DebtIOwe {
+			theirs = append(theirs, line)
+		} else {
+			mine = append(mine, line)
+		}
+	}
+	lines := []string{"Долги:"}
+	if len(mine) > 0 {
+		lines = append(lines, "Мне должны:")
+		lines = append(lines, numbered(mine)...)
+	}
+	if len(theirs) > 0 {
+		lines = append(lines, "Я должен:")
+		lines = append(lines, numbered(theirs)...)
+	}
+	lines = append(lines, fmt.Sprintf("Итого: мне должны %s ₽, я должен %s ₽.",
+		formatRubles(owesMe), formatRubles(iOwe)))
+	return strings.Join(lines, "\n")
+}
+
+// summaryLine renders the category summary locally: canonical category
+// order, Russian labels, and the precomputed total the model cannot swap.
+func summaryLine(p map[string]any) string {
+	byCat, _ := p["by_category"].(map[string]float64)
+	count, _ := p["count"].(int)
+	total, _ := p["total_rubles"].(float64)
+	if count == 0 || len(byCat) == 0 {
+		return "Расходов нет."
+	}
+	lines := []string{"Расходы по категориям:"}
+	for _, c := range domain.Categories() {
+		if v := byCat[string(c)]; v > 0 {
+			lines = append(lines, fmt.Sprintf("%s — %s ₽", c.Title(), formatRubles(v)))
+		}
+	}
+	totalLine := fmt.Sprintf("Итого: %s ₽ за %d %s.", formatRubles(total), count, ruPlural(count))
+	if note, _ := p["note"].(string); note != "" {
+		totalLine += " (" + note + ")"
+	}
+	return strings.Join(append(lines, totalLine), "\n")
+}
+
+// budgetListLine renders the monthly limits with this month's spending;
+// another member's numbers never appear (the payload is already scoped).
+func budgetListLine(p map[string]any) string {
+	items, _ := p["items"].([]map[string]any)
+	if len(items) == 0 {
+		return "Лимиты не заданы."
+	}
+	lines := []string{"Лимиты на месяц:"}
+	for _, it := range items {
+		cat, _ := it["category"].(string)
+		limit, _ := it["monthly_limit_rubles"].(float64)
+		spent, _ := it["spent_this_month_rubles"].(float64)
+		remaining, _ := it["remaining_rubles"].(float64)
+		exceeded, _ := it["exceeded"].(bool)
+		tail := fmt.Sprintf("потрачено %s ₽, осталось %s ₽", formatRubles(spent), formatRubles(remaining))
+		if exceeded {
+			tail = fmt.Sprintf("потрачено %s ₽, лимит превышен", formatRubles(spent))
+		}
+		lines = append(lines, fmt.Sprintf("%s — %s ₽: %s", domain.Category(cat).Title(), formatRubles(limit), tail))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// numbered prefixes each line with its 1-based position.
+func numbered(lines []string) []string {
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = fmt.Sprintf("%d. %s", i+1, l)
+	}
+	return out
+}
+
+// ruPlural picks the accusative form of «операция»: 1 операцию,
+// 2 операции, 5 операций.
+func ruPlural(n int) string {
+	switch {
+	case n%10 == 1 && n%100 != 11:
+		return "операцию"
+	case n%10 >= 2 && n%10 <= 4 && (n%100 < 10 || n%100 >= 20):
+		return "операции"
+	default:
+		return "операций"
+	}
+}
+
+// amountsOf lists open debt amounts for the disambiguation error.
+func amountsOf(debts []domain.Debt) string {
+	parts := make([]string, len(debts))
+	for i, d := range debts {
+		parts[i] = formatRubles(d.Amount.Rubles()) + " ₽"
+	}
+	return strings.Join(parts, ", ")
+}
+
+var idPattern = regexp.MustCompile(
+	`(?i)(?:id:\s*|id\s+)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+
+// stripIDNoise removes record ids a model may still leak into its final
+// reply despite the prompt rule; ids are internal tool-chain data.
+func stripIDNoise(s string) string {
+	out := idPattern.ReplaceAllString(s, "")
+	return strings.TrimSpace(strings.ReplaceAll(out, "  ", " "))
+}
+
+// formatRubles prints a ruble amount the way Russian text reads it:
+// 350.13 → «350,13», 200 → «200», 1000 → «1 000» (thousands grouped
+// with a space), 0.5 → «0,50».
+func formatRubles(v float64) string {
+	sign := ""
+	if v < 0 {
+		sign = "-"
+		v = -v
+	}
+	s := strconv.FormatFloat(math.Round(v*100)/100, 'f', -1, 64)
+	intPart, frac := s, ""
+	if idx := strings.IndexByte(s, '.'); idx >= 0 {
+		intPart, frac = s[:idx], s[idx+1:]
+		if len(frac) == 1 {
+			frac += "0" // 0.5 → «0,50», kopecks always read as two digits
+		}
+	}
+	intPart = groupThousands(intPart)
+	if frac != "" {
+		return sign + intPart + "," + frac
+	}
+	return sign + intPart
+}
+
+// groupThousands inserts a space every three digits: 1100 → «1 100».
+func groupThousands(s string) string {
+	if len(s) <= 3 {
+		return s
+	}
+	var b strings.Builder
+	pre := len(s) % 3
+	b.WriteString(s[:pre])
+	for i := pre; i < len(s); i += 3 {
+		b.WriteByte(' ')
+		b.WriteString(s[i : i+3])
+	}
+	return b.String()
+}
+
+// formatRuDate renders an ISO date as dd.mm.yyyy, falling back to the
+// raw string on a malformed date.
+func formatRuDate(s string) string {
+	t, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		return s
+	}
+	return t.Format("02.01.2006")
 }
 
 func (a *Agent) execTool(ctx context.Context, userID int64, call port.ToolCall) any {
@@ -393,7 +720,7 @@ func (a *Agent) toolDelete(ctx context.Context, userID int64, args string) any {
 	if err := a.expenses.Delete(ctx, &userID, in.ExpenseID); err != nil {
 		return toolError(err)
 	}
-	return map[string]bool{"ok": true}
+	return map[string]any{"ok": true}
 }
 
 func (a *Agent) toolSummary(ctx context.Context, userID int64, args string) any {
@@ -510,21 +837,66 @@ func (a *Agent) toolListDebts(ctx context.Context, userID int64) any {
 	}
 }
 
+type repayArgs struct {
+	Debtor string   `json:"debtor"`
+	Amount *float64 `json:"amount_rubles"`
+}
+
+// toolRepayDebt settles a debt by debtor name: the model never sees ids,
+// so it cannot pass one. With several open debts of the same person an
+// exact amount disambiguates; otherwise the error asks the model to
+// clarify with the user.
 func (a *Agent) toolRepayDebt(ctx context.Context, userID int64, args string) any {
-	var in struct {
-		DebtID string `json:"debt_id"`
-	}
+	var in repayArgs
 	if err := json.Unmarshal([]byte(args), &in); err != nil {
 		return toolError(errors.New("не удалось разобрать аргументы"))
 	}
-	if in.DebtID == "" {
-		return toolError(errors.New("укажите debt_id"))
+	debtor := strings.TrimSpace(in.Debtor)
+	if debtor == "" {
+		return toolError(errors.New("укажите, чей долг закрыть"))
 	}
-	d, err := a.debts.Settle(ctx, userID, in.DebtID, a.clock.Now())
+	open := true
+	items, err := a.debts.List(ctx, port.DebtFilter{UserID: &userID, Open: &open})
 	if err != nil {
 		return toolError(err)
 	}
-	return debtPayload(d)
+	var matches []domain.Debt
+	for _, d := range items {
+		if d.Debtor == debtor {
+			matches = append(matches, d)
+		}
+	}
+	if len(matches) == 0 {
+		return toolError(fmt.Errorf("открытых долгов %q нет", debtor))
+	}
+	if in.Amount != nil {
+		kop, kerr := domain.KopecksFromRubles(*in.Amount)
+		if kerr != nil {
+			return toolError(errors.New("некорректная сумма"))
+		}
+		for _, d := range matches {
+			if d.Amount == kop {
+				return a.settleDebt(ctx, userID, d)
+			}
+		}
+	}
+	if len(matches) > 1 {
+		return toolError(fmt.Errorf("у %s несколько открытых долгов: %s — уточните, какую сумму закрыть",
+			debtor, amountsOf(matches)))
+	}
+	if in.Amount != nil {
+		return toolError(fmt.Errorf("открытого долга %s на %s ₽ нет, есть только %s ₽",
+			debtor, formatRubles(*in.Amount), formatRubles(matches[0].Amount.Rubles())))
+	}
+	return a.settleDebt(ctx, userID, matches[0])
+}
+
+func (a *Agent) settleDebt(ctx context.Context, userID int64, d domain.Debt) any {
+	s, err := a.debts.Settle(ctx, userID, d.ID, a.clock.Now())
+	if err != nil {
+		return toolError(err)
+	}
+	return debtPayload(s)
 }
 
 func (a *Agent) toolSetBudget(ctx context.Context, userID int64, args string) any {

@@ -19,6 +19,7 @@ import (
 type Server struct {
 	expenses   *usecase.ExpenseService
 	users      *usecase.UserService
+	debts      *usecase.DebtService
 	logger     *slog.Logger
 	panelToken string
 	// panelFS overrides the embedded panel static (tests). nil = embed.
@@ -26,13 +27,14 @@ type Server struct {
 }
 
 // NewServer assembles the API. panelToken empty = open API.
-func NewServer(expenses *usecase.ExpenseService, users *usecase.UserService, logger *slog.Logger, panelToken string) *Server {
+func NewServer(expenses *usecase.ExpenseService, users *usecase.UserService, debts *usecase.DebtService, logger *slog.Logger, panelToken string) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Server{
 		expenses:   expenses,
 		users:      users,
+		debts:      debts,
 		logger:     logger,
 		panelToken: panelToken,
 	}
@@ -54,6 +56,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/expenses/{id}", s.auth(http.HandlerFunc(s.handleGetExpense)))
 	mux.Handle("PATCH /api/v1/expenses/{id}", s.auth(http.HandlerFunc(s.handleUpdateExpense)))
 	mux.Handle("DELETE /api/v1/expenses/{id}", s.auth(http.HandlerFunc(s.handleDeleteExpense)))
+
+	mux.Handle("GET /api/v1/debts", s.auth(http.HandlerFunc(s.handleListDebts)))
+	mux.Handle("POST /api/v1/debts", s.auth(http.HandlerFunc(s.handleCreateDebt)))
+	mux.Handle("POST /api/v1/debts/{id}/settle", s.auth(http.HandlerFunc(s.handleSettleDebt)))
 
 	// Everything unmatched lands here: unknown API paths get a JSON 404,
 	// known paths hit with the wrong method get a proper 405 + Allow (the
@@ -88,10 +94,17 @@ func allowedMethods(path string) ([]string, bool) {
 		return []string{http.MethodGet}, true
 	case "/api/v1/expenses":
 		return []string{http.MethodGet, http.MethodPost}, true
+	case "/api/v1/debts":
+		return []string{http.MethodGet, http.MethodPost}, true
 	}
 	if rest, ok := strings.CutPrefix(path, "/api/v1/expenses/"); ok &&
 		rest != "" && !strings.Contains(rest, "/") {
 		return []string{http.MethodGet, http.MethodPatch, http.MethodDelete}, true
+	}
+	if rest, ok := strings.CutPrefix(path, "/api/v1/debts/"); ok {
+		if id, ok := strings.CutSuffix(rest, "/settle"); ok && id != "" && !strings.Contains(id, "/") {
+			return []string{http.MethodPost}, true
+		}
 	}
 	return nil, false
 }

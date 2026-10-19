@@ -32,15 +32,25 @@ func newTestServer(t *testing.T) (*Server, *fakes.Expenses, *fakes.Users) {
 	return newTestServerToken(t, "")
 }
 
-// newTestServerToken builds a Server with an optional bearer token.
-func newTestServerToken(t *testing.T, token string) (*Server, *fakes.Expenses, *fakes.Users) {
+// newTestServerAll builds a Server with every service (expenses, users,
+// debts) on fake ports and returns the fakes for assertions.
+func newTestServerAll(t *testing.T, token string) (*Server, *fakes.Expenses, *fakes.Users, *fakes.Debts) {
 	t.Helper()
 	expenses := fakes.NewExpenses()
 	users := fakes.NewUsers()
+	debts := fakes.NewDebts()
 	svc := usecase.NewExpenseService(expenses, users, fakes.Clock{T: testNow})
 	usvc := usecase.NewUserService(users, fakes.Clock{T: testNow})
+	dsvc := usecase.NewDebtService(debts, users, fakes.Clock{T: testNow})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewServer(svc, usvc, logger, token), expenses, users
+	return NewServer(svc, usvc, dsvc, logger, token), expenses, users, debts
+}
+
+// newTestServerToken builds a Server with an optional bearer token.
+func newTestServerToken(t *testing.T, token string) (*Server, *fakes.Expenses, *fakes.Users) {
+	t.Helper()
+	srv, expenses, users, _ := newTestServerAll(t, token)
+	return srv, expenses, users
 }
 
 // do runs a request against the server handler and returns the response.
@@ -125,7 +135,7 @@ func TestRecoverTurnsPanicInto500(t *testing.T) {
 	users := fakes.NewUsers()
 	svc := usecase.NewExpenseService(panickingRepo{Expenses: expenses}, users, fakes.Clock{T: testNow})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv = NewServer(svc, usecase.NewUserService(users, fakes.Clock{T: testNow}), logger, "")
+	srv = NewServer(svc, usecase.NewUserService(users, fakes.Clock{T: testNow}), nil, logger, "")
 
 	rec := do(t, srv.Handler(), "GET", "/api/v1/expenses", "")
 	if rec.Code != http.StatusInternalServerError {

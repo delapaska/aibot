@@ -114,7 +114,7 @@ func newStaticHandler(t *testing.T, files map[string]string) http.Handler {
 		fsys[name] = &fstest.MapFile{Data: []byte(content)}
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := NewServer(nil, nil, logger, "")
+	s := NewServer(nil, nil, nil, logger, "")
 	s.panelFS = fsys
 	return s.Handler()
 }

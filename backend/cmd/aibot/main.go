@@ -83,11 +83,12 @@ func run() error {
 	budgets := usecase.NewBudgetService(budgetRepo, expenses, clock)
 
 	// LLM agent over the expense, debt and budget services.
-	llmClient := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel, logger)
+	llmClient := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel, logger).
+		WithFallbacks(cfg.LLMFallbackModels)
 	agent := usecase.NewAgent(llmClient, expenses, debts, budgets, clock)
 
 	// HTTP API of the panel.
-	api := httpapi.NewServer(expenses, users, logger, cfg.PanelToken)
+	api := httpapi.NewServer(expenses, users, debts, logger, cfg.PanelToken)
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           api.Handler(),

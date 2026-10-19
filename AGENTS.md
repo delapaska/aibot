@@ -20,7 +20,6 @@
   - `internal/app/usecase/` — сценарии приложения; зависят только от портов и домена
   - `internal/infra/` — реализации портов и инфраструктура: `httpapi/`, `telegram/` (long polling), `llm/` (OpenAI-совместимый), `postgres/` (pgx, миграции), `clocksys/`, `config/` (env-конфиг)
 - `frontend/` — React + Vite + TypeScript, статика встраивается в Go-бинарь
-- `docs/` — `architecture.md`, `security.md`
 - `docker-compose.yml`, `Dockerfile`, `Makefile`, `.env.example`
 
 ## Команды

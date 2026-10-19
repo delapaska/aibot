@@ -15,10 +15,11 @@ import (
 const (
 	pollRetryDelay = 3 * time.Second
 	// handleTimeout bounds one update, including every LLM round-trip.
-	// Free LLM tiers answer slowly and one request may need several
-	// rounds (find the expense, then change it), so this is generous:
-	// the user sees the progress bar and typing status meanwhile.
-	handleTimeout   = 180 * time.Second
+	// Free LLM tiers answer slowly, and a heavy request (a weekly
+	// summary) needs two rounds — plus retries for rate limits and
+	// blank answers — so the budget is generous: the user sees the
+	// progress bar and typing status meanwhile.
+	handleTimeout   = 300 * time.Second
 	maxHandlers     = 4  // concurrent updates; a family needs few
 	defaultPollSecs = 50 // long-poll window
 	// The typing chat action expires after ~5s; renew it early so the
@@ -30,7 +31,7 @@ const (
 	progressDelay = 3 * time.Second   // fast answers get no progress message
 	progressTick  = 4 * time.Second   // edits are rate-limited; keep it slow
 	progressSteps = 8                 // bar width
-	progressSpan  = 150 * time.Second // bar fills (to 7/8) over this span
+	progressSpan  = 270 * time.Second // bar fills (to 7/8) over this span
 	// Removing the placeholder must outlive the handler deadline and
 	// survive a network blip: its own timeout plus one retry.
 	cleanupTimeout = 10 * time.Second

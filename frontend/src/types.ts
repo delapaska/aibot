@@ -54,3 +54,28 @@ export interface ExpenseInput {
   spent_at: string // YYYY-MM-DD
   comment?: string
 }
+
+export type DebtDirection = 'owes_me' | 'i_owe'
+
+export interface Debt {
+  id: string
+  user_id: number
+  debtor: string
+  direction: DebtDirection
+  amount: string
+  comment: string
+  created_at: string
+  settled_at: string | null
+}
+
+export interface DebtsPage {
+  items: Debt[]
+}
+
+export interface DebtInput {
+  user_id: number
+  debtor: string
+  amount: string
+  direction: DebtDirection
+  comment?: string
+}

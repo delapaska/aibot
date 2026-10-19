@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/delapaska/aibot/internal/app/port"
+	"github.com/delapaska/aibot/internal/infra/httpclient"
 )
 
 const (
@@ -25,6 +26,9 @@ const (
 	// the request open until an update arrives or the window expires.
 	requestTimeout = defaultPollTimeout*time.Second + 15*time.Second
 	maxBodyBytes   = 4 << 20 // updates can carry media metadata; cap the body
+	// parseModeHTML makes Telegram render the markup the adapter produces
+	// (see markdown.go): replies arrive as markdown and go out as HTML.
+	parseModeHTML = "HTML"
 )
 
 // Client talks to the Telegram Bot API.
@@ -40,7 +44,7 @@ func New(token string, logger *slog.Logger) *Client {
 	return &Client{
 		token:  token,
 		base:   defaultBase,
-		hc:     &http.Client{Timeout: requestTimeout},
+		hc:     httpclient.New(requestTimeout),
 		logger: logger,
 	}
 }
@@ -91,12 +95,14 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSec int) (
 }
 
 // SendMessage delivers one text message and returns the created message
-// id, so the caller can edit or delete it later.
+// id, so the caller can edit or delete it later. The text is markdown;
+// it is rendered into the HTML subset Telegram understands.
 func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) (int64, error) {
 	body, err := json.Marshal(struct {
-		ChatID int64  `json:"chat_id"`
-		Text   string `json:"text"`
-	}{ChatID: chatID, Text: text})
+		ChatID    int64  `json:"chat_id"`
+		Text      string `json:"text"`
+		ParseMode string `json:"parse_mode"`
+	}{ChatID: chatID, Text: toTelegramHTML(text), ParseMode: parseModeHTML})
 	if err != nil {
 		return 0, fmt.Errorf("telegram: encode message: %w", err)
 	}
@@ -132,13 +138,15 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) (in
 	return out.Result.MessageID, nil
 }
 
-// EditMessageText rewrites the text of an earlier bot message.
+// EditMessageText rewrites the text of an earlier bot message. The text
+// is rendered like SendMessage's.
 func (c *Client) EditMessageText(ctx context.Context, chatID int64, messageID int64, text string) error {
 	return c.mutateMessage(ctx, "editMessageText", struct {
 		ChatID    int64  `json:"chat_id"`
 		MessageID int64  `json:"message_id"`
 		Text      string `json:"text"`
-	}{ChatID: chatID, MessageID: messageID, Text: text})
+		ParseMode string `json:"parse_mode"`
+	}{ChatID: chatID, MessageID: messageID, Text: toTelegramHTML(text), ParseMode: parseModeHTML})
 }
 
 // DeleteMessage removes an earlier bot message.
